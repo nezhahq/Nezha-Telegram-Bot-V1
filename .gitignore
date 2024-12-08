@@ -1,0 +1,4 @@
+# .gitignore
+.env
+users.db
+.DS_Store
