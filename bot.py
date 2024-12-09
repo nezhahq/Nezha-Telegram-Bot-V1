@@ -30,7 +30,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATABASE_PATH = 'users.db'
 
 # 定义阶段
-BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD = range(3)
+BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD, BIND_ALIAS = range(4)
 SEARCH_SERVER = range(1)
 
 # 初始化数据库
@@ -95,6 +95,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 可用命令：
 /bind - 绑定账号
 /unbind - 解绑账号
+/dashboard - 管理面板
 /overview - 查看服务器状态总览
 /server - 查看单台服务器状态
 /cron - 执行计划任务
@@ -108,13 +109,8 @@ async def bind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请与机器人私聊进行绑定操作，\n避免机密信息泄露。")
         return ConversationHandler.END
 
-    user = await db.get_user(update.effective_user.id)
-    if user:
-        await update.message.reply_text("您已绑定账号，如需重新绑定，请先使用 /unbind 命令解绑。")
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text("请输入您的用户名：")
-        return BIND_USERNAME
+    await update.message.reply_text("请输入您的用户名：")
+    return BIND_USERNAME
 
 async def bind_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['username'] = update.message.text.strip()
@@ -129,9 +125,16 @@ async def bind_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bind_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboard_url = update.message.text.strip()
     context.user_data['dashboard_url'] = dashboard_url
+    await update.message.reply_text("请为这个面板设置一个别名（如：主面板、备用等）：")
+    return BIND_ALIAS
+
+async def bind_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alias = update.message.text.strip()
+    context.user_data['alias'] = alias
     telegram_id = update.effective_user.id
     username = context.user_data['username']
     password = context.user_data['password']
+    dashboard_url = context.user_data['dashboard_url']
 
     # 测试连接
     try:
@@ -143,17 +146,29 @@ async def bind_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # 保存到数据库
-    await db.add_user(telegram_id, username, password, dashboard_url)
+    await db.add_user(telegram_id, username, password, dashboard_url, alias)
     await update.message.reply_text("绑定成功！您现在可以使用机器人的功能了。")
     return ConversationHandler.END
 
 async def unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = await db.get_user(update.effective_user.id)
-    if user:
-        await db.delete_user(update.effective_user.id)
-        await update.message.reply_text("已解绑。")
-    else:
-        await update.message.reply_text("您尚未绑定账号。")
+    dashboards = await db.get_all_dashboards(update.effective_user.id)
+    if not dashboards:
+        await update.message.reply_text("您尚未绑定任何面板。")
+        return
+
+    keyboard = []
+    # 添加每个 dashboard 的解绑选项
+    for dashboard in dashboards:
+        default_mark = "（默认）" if dashboard['is_default'] else ""
+        button_text = f"解绑 {dashboard['alias']}{default_mark}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"unbind_{dashboard['id']}")])
+    
+    # 添加解绑所有的选项
+    if len(dashboards) > 1:
+        keyboard.append([InlineKeyboardButton("解绑所有面板", callback_data="unbind_all")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("请选择要解绑的面板：", reply_markup=reply_markup)
 
 async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
@@ -245,6 +260,73 @@ async def search_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+
+    if data.startswith('unbind_'):
+        if data == 'unbind_all':
+            await db.delete_user(query.from_user.id)
+            await query.edit_message_text("已解绑所有面板，您可以使用 /bind 重新绑定。")
+        else:
+            dashboard_id = int(data.split('_')[-1])
+            # 获取当前面板信息，用于判断是否是默认面板
+            dashboards = await db.get_all_dashboards(query.from_user.id)
+            current_dashboard = next((d for d in dashboards if d['id'] == dashboard_id), None)
+            was_default = current_dashboard and current_dashboard['is_default']
+            
+            has_remaining = await db.delete_dashboard(query.from_user.id, dashboard_id)
+            
+            if not has_remaining:
+                await query.edit_message_text("已解绑最后一个面板，您可以使用 /bind 重新绑定。")
+            else:
+                # 新面板列表
+                dashboards = await db.get_all_dashboards(query.from_user.id)
+                keyboard = []
+                
+                # 如果解绑的是默认面板，显示新的默认面板提示
+                if was_default:
+                    new_default = next((d for d in dashboards if d['is_default']), None)
+                    message = f"已解绑面板，新的默认面板已设置为：{new_default['alias']}\n\n请选择要解绑的面板："
+                else:
+                    message = "请选择要解绑的面板："
+                
+                for dashboard in dashboards:
+                    default_mark = "（默认）" if dashboard['is_default'] else ""
+                    button_text = f"解绑 {dashboard['alias']}{default_mark}"
+                    keyboard.append([InlineKeyboardButton(button_text, callback_data=f"unbind_{dashboard['id']}")])
+                
+                if len(dashboards) > 1:
+                    keyboard.append([InlineKeyboardButton("解绑所有面板", callback_data="unbind_all")])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(message, reply_markup=reply_markup)
+        return
+
+    elif data.startswith('set_default_'):
+        dashboard_id = int(data.split('_')[-1])
+        dashboards = await db.get_all_dashboards(query.from_user.id)
+        selected_dashboard = next((d for d in dashboards if d['id'] == dashboard_id), None)
+        
+        if not selected_dashboard:
+            await query.answer("未找到该面板", show_alert=True)
+            return
+        
+        if selected_dashboard['is_default']:
+            await query.answer("这已经是默认面板了", show_alert=True)
+            return
+            
+        # 直接切换默认面板
+        await db.set_default_dashboard(query.from_user.id, dashboard_id)
+        
+        # 更新面板列表
+        dashboards = await db.get_all_dashboards(query.from_user.id)
+        keyboard = []
+        for dashboard in dashboards:
+            default_mark = "（当前默认）" if dashboard['is_default'] else ""
+            button_text = f"{dashboard['alias']}{default_mark}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        return
 
     user = await db.get_user(query.from_user.id)
     if not user:
@@ -491,6 +573,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'refresh_availability':
         await view_availability(query, context, api)
 
+    elif data.startswith('set_default_'):
+        dashboard_id = int(data.split('_')[-1])
+        await db.set_default_dashboard(query.from_user.id, dashboard_id)
+        await query.edit_message_text("已更新默认面板。")
+        return
+
+    elif data.startswith('dashboard_'):
+        dashboard_id = int(data.split('_')[-1])
+        dashboards = await db.get_all_dashboards(query.from_user.id)
+        selected_dashboard = next((d for d in dashboards if d['id'] == dashboard_id), None)
+        
+        if not selected_dashboard:
+            await query.answer("未找到该面板", show_alert=True)
+            return
+        
+        if selected_dashboard['is_default']:
+            await query.answer("这已经是默认面板了", show_alert=True)
+            return
+            
+        # 直接切换默认面板
+        await db.set_default_dashboard(query.from_user.id, dashboard_id)
+        
+        # 更新面板列表
+        dashboards = await db.get_all_dashboards(query.from_user.id)
+        keyboard = []
+        for dashboard in dashboards:
+            default_mark = "（当前默认）" if dashboard['is_default'] else ""
+            button_text = f"{dashboard['alias']}{default_mark}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        return
+        
+    elif data == "dashboard_back":
+        # 返回面板列表
+        dashboards = await db.get_all_dashboards(query.from_user.id)
+        keyboard = []
+        for dashboard in dashboards:
+            default_mark = "（当前默认）" if dashboard['is_default'] else ""
+            button_text = f"{dashboard['alias']}{default_mark}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        return
+
 async def view_loop_traffic(query, context, api):
     # 获取服务状态
     try:
@@ -625,6 +754,21 @@ async def services_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("请选择要查看的服务信息：", reply_markup=reply_markup)
 
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dashboards = await db.get_all_dashboards(update.effective_user.id)
+    if not dashboards:
+        await update.message.reply_text("您还没有绑定任何面板。")
+        return
+
+    keyboard = []
+    for dashboard in dashboards:
+        default_mark = "（当前默认）" if dashboard['is_default'] else ""
+        button_text = f"{dashboard['alias']}{default_mark}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("您的面板列表：", reply_markup=reply_markup)
+
 def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -642,6 +786,7 @@ def main():
     application.add_handler(CommandHandler('overview', overview))
     application.add_handler(CommandHandler('cron', cron_jobs))
     application.add_handler(CommandHandler('services', services_overview))
+    application.add_handler(CommandHandler('dashboard', dashboard))
 
     # 绑定命令的会话处理
     bind_handler = ConversationHandler(
@@ -650,6 +795,7 @@ def main():
             BIND_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_username)],
             BIND_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_password)],
             BIND_DASHBOARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_dashboard)],
+            BIND_ALIAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_alias)],
         },
         fallbacks=[]
     )
