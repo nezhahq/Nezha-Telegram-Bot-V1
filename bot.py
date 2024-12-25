@@ -7,7 +7,7 @@ from dateutil import parser
 from dotenv import load_dotenv
 import os
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes, filters
@@ -32,6 +32,9 @@ DATABASE_PATH = 'users.db'
 # 定义阶段
 BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD, BIND_ALIAS = range(4)
 SEARCH_SERVER = range(1)
+
+# 群组消息存活时间（秒）
+GROUP_MESSAGE_LIFETIME = 180  # 3分钟
 
 # 初始化数据库
 db = Database(DATABASE_PATH)
@@ -85,14 +88,49 @@ def mask_ipv6(ipv6_address):
     masked_ip = ':'.join(parts[:2]) + ':xx:xx:xx:xx'
     return masked_ip
 
+async def delete_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """
+    延迟删除消息的任务
+    """
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning(f"删除消息失败: {e}")
+
+async def send_message_with_auto_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    """
+    发送消息并在群组中自动设置延迟删除
+    """
+    message = await update.message.reply_text(text, **kwargs)
+    
+    # 如果是群组消息，设置定时删除
+    if update.effective_chat.type in ['group', 'supergroup']:
+        # 延迟5秒删除原始命令消息
+        context.job_queue.run_once(
+            lambda ctx: delete_message_later(ctx, update.message.chat_id, update.message.message_id),
+            5  # 5秒后删除原始命令
+        )
+            
+        # 设置定时删除回复的消息
+        context.job_queue.run_once(
+            lambda ctx: delete_message_later(ctx, message.chat_id, message.message_id),
+            GROUP_MESSAGE_LIFETIME
+        )
+    
+    return message
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await send_message_with_auto_delete(
+        update, 
+        context,
         "欢迎使用 Nezha 监控机器人！\n请使用 /bind 命令绑定您的账号。\n请注意，使用公共机器人有安全风险，用户名密码将会被记录用以鉴权，解绑删除。"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""
-可用命令：
+    await send_message_with_auto_delete(
+        update,
+        context,
+        """可用命令：
 /bind - 绑定账号
 /unbind - 解绑账号
 /dashboard - 管理面板
@@ -101,30 +139,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /cron - 执行计划任务
 /services - 查看服务状态总览
 /help - 获取帮助
-    """)
+        """
+    )
 
 async def bind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 检查当前对话类型
     if update.effective_chat.type != "private":
-        await update.message.reply_text("请与机器人私聊进行绑定操作，\n避免机密信息泄露。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请与机器人私聊进行绑定操作，\n避免机密信息泄露。"
+        )
         return ConversationHandler.END
 
+    # 在私聊中直接使用 reply_text
     await update.message.reply_text("请输入您的用户名：")
     return BIND_USERNAME
 
 async def bind_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['username'] = update.message.text.strip()
+    # 在私聊中直接使用 reply_text
     await update.message.reply_text("请输入您的密码：")
     return BIND_PASSWORD
 
 async def bind_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['password'] = update.message.text.strip()
+    # 在私聊中直接使用 reply_text
     await update.message.reply_text("请输入您的 Dashboard 地址（例如：https://nezha.example.com）：")
     return BIND_DASHBOARD
 
 async def bind_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboard_url = update.message.text.strip()
     context.user_data['dashboard_url'] = dashboard_url
+    # 在私聊中直接使用 reply_text
     await update.message.reply_text("请为这个面板设置一个别名（如：主面板、备用等）：")
     return BIND_ALIAS
 
@@ -153,7 +200,11 @@ async def bind_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboards = await db.get_all_dashboards(update.effective_user.id)
     if not dashboards:
-        await update.message.reply_text("您尚未绑定任何面板。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "您尚未绑定任何面板。"
+        )
         return
 
     keyboard = []
@@ -168,22 +219,34 @@ async def unbind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("解绑所有面板", callback_data="unbind_all")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("请选择要解绑的面板：", reply_markup=reply_markup)
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "请选择要解绑的面板：",
+        reply_markup=reply_markup
+    )
 
 async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
     if not user:
-        await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请先使用 /bind 命令绑定您的账号。"
+        )
         return
 
     api = NezhaAPI(user['dashboard_url'], user['username'], user['password'])
     try:
         data = await api.get_overview()
     except Exception as e:
-        await update.message.reply_text(f"获取数据失败：{e}")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            f"获取数据失败：{e}"
+        )
         await api.close()
         return
-    # print("返回的服务数据:", data)
 
     if data and data.get('success'):
         servers = data['data']
@@ -218,18 +281,36 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+        await send_message_with_auto_delete(
+            update,
+            context,
+            response,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
     else:
-        await update.message.reply_text("获取服务器信息失败。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "获取服务器信息失败。"
+        )
     await api.close()
 
 async def server_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
     if not user:
-        await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请先使用 /bind 命令绑定您的账号。"
+        )
         return
 
-    await update.message.reply_text("请输入要查询的服务器名称（支持模糊搜索）：")
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "请输入要查询的服务器名称（支持模糊搜索）："
+    )
     return SEARCH_SERVER
 
 async def search_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,12 +320,20 @@ async def search_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await api.search_servers(query_text)
     except Exception as e:
-        await update.message.reply_text(f"搜索失败：{e}")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            f"搜索失败：{e}"
+        )
         await api.close()
         return ConversationHandler.END
 
     if not results:
-        await update.message.reply_text("未找到匹配的服务器。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "未找到匹配的服务器。"
+        )
         await api.close()
         return ConversationHandler.END
 
@@ -253,7 +342,12 @@ async def search_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for s in results
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("请选择服务器：", reply_markup=reply_markup)
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "请选择服务器：",
+        reply_markup=reply_markup
+    )
     await api.close()
     return ConversationHandler.END
 
@@ -264,7 +358,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith('unbind_'):
         if data == 'unbind_all':
             await db.delete_user(query.from_user.id)
-            await query.edit_message_text("已解绑所有面板，您可以使用 /bind 重新绑定。")
+            await edit_message_with_auto_delete(query, "已解绑所有面板，您可以使用 /bind 重新绑定。")
         else:
             dashboard_id = int(data.split('_')[-1])
             # 获取当前面板信息，用于判断是否是默认面板
@@ -275,7 +369,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             has_remaining = await db.delete_dashboard(query.from_user.id, dashboard_id)
             
             if not has_remaining:
-                await query.edit_message_text("已解绑最后一个面板，您可以使用 /bind 重新绑定。")
+                await edit_message_with_auto_delete(query, "已解绑最后一个面板，您可以使用 /bind 重新绑定。")
             else:
                 # 新面板列表
                 dashboards = await db.get_all_dashboards(query.from_user.id)
@@ -297,7 +391,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard.append([InlineKeyboardButton("解绑所有面板", callback_data="unbind_all")])
                 
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(message, reply_markup=reply_markup)
+                await edit_message_with_auto_delete(query, message, reply_markup=reply_markup)
         return
 
     elif data.startswith('set_default_'):
@@ -325,7 +419,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, "您的面板列表：", reply_markup=reply_markup)
         return
 
     user = await db.get_user(query.from_user.id)
@@ -352,14 +446,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             server = await api.get_server_detail(server_id)
         except Exception as e:
-            await query.edit_message_text(f"获取服务器详情失败：{e}")
+            await edit_message_with_auto_delete(query, f"获取服务器详情失败：{e}")
             await api.close()
             return
 
         await api.close()
 
         if not server:
-            await query.edit_message_text("未找到该服务器。")
+            await edit_message_with_auto_delete(query, "未找到该服务器。")
             return
 
         name = server.get('name', '未知')
@@ -414,7 +508,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data=f"refresh_server_{server_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
 
     elif data.startswith('refresh_server_'):
         server_id = int(data.split('_')[-1])
@@ -422,14 +516,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             server = await api.get_server_detail(server_id)
         except Exception as e:
-            await query.edit_message_text(f"获取服务器详情失败：{e}")
+            await edit_message_with_auto_delete(query, f"获取服务器详情失败：{e}")
             await api.close()
             return
 
         await api.close()
 
         if not server:
-            await query.edit_message_text("未找到该服务器。")
+            await edit_message_with_auto_delete(query, "未找到该服务器。")
             return
 
         # 同上，构建响应和刷新按钮
@@ -484,14 +578,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
         keyboard = [[InlineKeyboardButton("刷新", callback_data=f"refresh_server_{server_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
 
     elif data == 'refresh_overview':
         # 重新获取概览数据，与 overview 函数类似
         try:
             data = await api.get_overview()
         except Exception as e:
-            await query.edit_message_text(f"获取数据失败：{e}")
+            await edit_message_with_auto_delete(query, f"获取数据失败：{e}")
             await api.close()
             return
 
@@ -528,9 +622,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
             keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+            await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
         else:
-            await query.edit_message_text("获取服务器信息失败。")
+            await edit_message_with_auto_delete(query, "获取服务器信息失败。")
         await api.close()
         
     elif data.startswith('cron_job_'):
@@ -540,26 +634,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("取消", callback_data="cancel")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("您确定要执行此计划任务吗？", reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, "您确定要执行此计划任务吗？", reply_markup=reply_markup)
 
     elif data.startswith('confirm_cron_'):
         cron_id = int(data.split('_')[-1])
         try:
             result = await api.run_cron_job(cron_id)
         except Exception as e:
-            await query.edit_message_text(f"执行失败：{e}")
+            await edit_message_with_auto_delete(query, f"执行失败：{e}")
             await api.close()
             return
 
         await api.close()
 
         if result and result.get('success'):
-            await query.edit_message_text("计划任务已执行。")
+            await edit_message_with_auto_delete(query, "计划任务已执行。")
         else:
-            await query.edit_message_text("执行失败。")
+            await edit_message_with_auto_delete(query, "执行失败。")
 
     elif data == 'cancel':
-        await query.edit_message_text("操作已取消。")
+        await edit_message_with_auto_delete(query, "操作已取消。")
 
     elif data == 'view_loop_traffic':
         await view_loop_traffic(query, context, api)
@@ -576,7 +670,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('set_default_'):
         dashboard_id = int(data.split('_')[-1])
         await db.set_default_dashboard(query.from_user.id, dashboard_id)
-        await query.edit_message_text("已更新默认面板。")
+        await edit_message_with_auto_delete(query, "已更新默认面板。")
         return
 
     elif data.startswith('dashboard_'):
@@ -604,7 +698,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, "您的面板列表：", reply_markup=reply_markup)
         return
         
     elif data == "dashboard_back":
@@ -617,7 +711,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("您的面板列表：", reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, "您的面板列表：", reply_markup=reply_markup)
         return
 
 async def view_loop_traffic(query, context, api):
@@ -625,14 +719,14 @@ async def view_loop_traffic(query, context, api):
     try:
         services_data = await api.get_services_status()
     except Exception as e:
-        await query.edit_message_text(f"获取服务信息失败：{e}")
+        await edit_message_with_auto_delete(query, f"获取服务信息失败：{e}")
         await api.close()
         return
 
     if services_data and services_data.get('success'):
         cycle_stats = services_data['data'].get('cycle_transfer_stats', {})
         if not cycle_stats:
-            await query.edit_message_text("暂无循环流量信息。")
+            await edit_message_with_auto_delete(query, "暂无循环流量信息。")
             await api.close()
             return
 
@@ -658,9 +752,9 @@ async def view_loop_traffic(query, context, api):
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_loop_traffic")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
     else:
-        await query.edit_message_text("获取循环流量信息失败。")
+        await edit_message_with_auto_delete(query, "获取循环流量信息失败。")
     await api.close()
 
 async def view_availability(query, context, api):
@@ -668,7 +762,7 @@ async def view_availability(query, context, api):
     try:
         services_data = await api.get_services_status()
     except Exception as e:
-        await query.edit_message_text(f"获取服务信息失败：{e}")
+        await edit_message_with_auto_delete(query, f"获取服务信息失败：{e}")
         await api.close()
         return
     # print("返回的服务数据:", services_data)
@@ -676,7 +770,7 @@ async def view_availability(query, context, api):
     if services_data and services_data.get('success'):
         services = services_data['data'].get('services', {})
         if not services:
-            await query.edit_message_text("暂无可用性监测信息。")
+            await edit_message_with_auto_delete(query, "暂无可用性监测信息。")
             await api.close()
             return
 
@@ -705,29 +799,41 @@ async def view_availability(query, context, api):
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_availability")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+        await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
     else:
-        await query.edit_message_text("获取可用性监测信息失败。")
+        await edit_message_with_auto_delete(query, "获取可用性监测信息失败。")
     await api.close()
 
 async def cron_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
     if not user:
-        await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请先使用 /bind 命令绑定您的账号。"
+        )
         return
 
     api = NezhaAPI(user['dashboard_url'], user['username'], user['password'])
     try:
         data = await api.get_cron_jobs()
     except Exception as e:
-        await update.message.reply_text(f"获取计划任务失败：{e}")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            f"获取计划任务失败：{e}"
+        )
         await api.close()
         return
 
     if data and data.get('success'):
         cron_jobs = data['data']
         if not cron_jobs:
-            await update.message.reply_text("暂无计划任务。")
+            await send_message_with_auto_delete(
+                update,
+                context,
+                "暂无计划任务。"
+            )
             await api.close()
             return
 
@@ -736,15 +842,28 @@ async def cron_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for job in cron_jobs
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("请选择要执行的计划任务：", reply_markup=reply_markup)
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请选择要执行的计划任务：",
+            reply_markup=reply_markup
+        )
     else:
-        await update.message.reply_text("获取计划任务失败。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "获取计划任务失败。"
+        )
     await api.close()
 
 async def services_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
     if not user:
-        await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "请先使用 /bind 命令绑定您的账号。"
+        )
         return
 
     keyboard = [
@@ -752,12 +871,21 @@ async def services_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("查看可用性监测信息", callback_data="view_availability")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("请选择要查看的服务信息：", reply_markup=reply_markup)
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "请选择要查看的服务信息：",
+        reply_markup=reply_markup
+    )
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboards = await db.get_all_dashboards(update.effective_user.id)
     if not dashboards:
-        await update.message.reply_text("您还没有绑定任何面板。")
+        await send_message_with_auto_delete(
+            update,
+            context,
+            "您还没有绑定任何面板。"
+        )
         return
 
     keyboard = []
@@ -767,7 +895,27 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_default_{dashboard['id']}")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("您的面板列表：", reply_markup=reply_markup)
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "您的面板列表：",
+        reply_markup=reply_markup
+    )
+
+async def edit_message_with_auto_delete(query: CallbackQuery, text: str, **kwargs):
+    """
+    编辑消息并在群组中设置自动删除
+    """
+    await query.edit_message_text(text, **kwargs)
+    
+    # 如果是群组消息，设置定时删除
+    if query.message.chat.type in ['group', 'supergroup']:
+        context = query.get_bot()
+        # 设置定时删除
+        context.job_queue.run_once(
+            lambda ctx: delete_message_later(ctx, query.message.chat_id, query.message.message_id),
+            GROUP_MESSAGE_LIFETIME
+        )
 
 def main():
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
