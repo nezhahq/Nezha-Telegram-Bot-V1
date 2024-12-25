@@ -43,11 +43,13 @@ class Database:
                     alias = "NEZHA"
             
             # 添加 dashboard
-            cursor = await db.execute('''
+            await db.execute('''
                 INSERT INTO dashboards (telegram_id, username, password, dashboard_url, alias)
                 VALUES (?, ?, ?, ?, ?)
-                RETURNING id
             ''', (telegram_id, username, password, dashboard_url, alias))
+            
+            # 获取最后插入的 dashboard_id
+            cursor = await db.execute('SELECT last_insert_rowid()')
             dashboard_id = (await cursor.fetchone())[0]
             
             # 如果用户还没有默认 dashboard，设置这个为默认
