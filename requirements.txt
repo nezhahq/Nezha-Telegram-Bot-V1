@@ -1,4 +1,4 @@
-python-telegram-bot==20.3
+python-telegram-bot[job-queue]==20.3
 aiohttp==3.8.1
 aiosqlite==0.19.0
 python-dateutil==2.8.2
