@@ -80,7 +80,7 @@
     
    ```bash
    docker run -d --name nezhatgbot-v1 --restart unless-stopped \
-      -e TELEGRAM_TOKEN="TGBotToken" \
+      -e TELEGRAM_TOKEN="your_telegram_bot_token" \
       -e TZ="Asia/Shanghai" \
       -v ~/nezhabot:/app/db \
       ghcr.io/utopeadia/nezhatgbot-v1:latest
@@ -107,7 +107,7 @@
 
    ```bash
    docker run -d --name nezhatgbot-v1 --restart unless-stopped \
-      -e TELEGRAM_TOKEN="TGBotToken" \
+      -e TELEGRAM_TOKEN="your_telegram_bot_token" \
       -e TZ="Asia/Shanghai" \
       -v ~/nezhabot:/app/db \
       nezhatgbot-v1
