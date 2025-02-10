@@ -6,7 +6,7 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-VOLUME ["/app"]
+VOLUME ["/app/db"]
 ENV TELEGRAM_TOKEN=$TELEGRAM_TOKEN
 
 CMD ["python", "bot.py"]

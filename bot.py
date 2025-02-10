@@ -27,7 +27,7 @@ load_dotenv()
 
 # 定义常量和配置
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-DATABASE_PATH = 'users.db'
+DATABASE_PATH = 'db/users.db'
 
 # 定义阶段
 BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD, BIND_ALIAS = range(4)
