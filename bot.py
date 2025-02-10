@@ -47,12 +47,12 @@ def get_localized_time_string():
     if tz_str:
         try:
             tz = pytz.timezone(tz_str)
-            localized_time = datetime.datetime.now(tz)
+            localized_time = datetime.now(tz)
             return localized_time.strftime('%Y-%m-%d %H:%M:%S %Z%z')
         except pytz.exceptions.UnknownTimeZoneError:
             return "Error: Invalid Time Zone in TZ environment variable."
     else:
-        utc_time = datetime.datetime.utcnow()
+        utc_time = datetime.utcnow()
         return utc_time.strftime('%Y-%m-%d %H:%M:%S UTC')
 
 # 添加 format_bytes 函数
