@@ -25,8 +25,8 @@
 1. **克隆仓库**
 
    ```bash
-   git clone https://github.com/yourusername/nezha-telegram-bot.git
-   cd nezha-telegram-bot
+   git clone https://github.com/nezhahq/Nezha-Telegram-Bot-V1.git
+   cd Nezha-Telegram-Bot-V1
    ```
 
 2. **创建虚拟环境**
@@ -67,6 +67,54 @@
    ```
    2024-12-08 17:50:39,139 - telegram.ext.Application - INFO - Application started
    ```
+### 🔧 docker部署
+#### 🏠 直接使用远程镜像
+
+1. **拉取镜像**
+
+   ```bash
+   docker pull ghcr.io/utopeadia/nezhatgbot-v1:latest
+   ```
+
+2. **创建并运行容器**
+    
+   ```bash
+   docker run -d --name nezhatgbot-v1 --restart unless-stopped \
+      -e TELEGRAM_TOKEN="your_telegram_bot_token" \
+      -e TZ="Asia/Shanghai" \
+      -v ~/nezhabot:/app/db \
+      ghcr.io/utopeadia/nezhatgbot-v1:latest
+   ```
+
+  * 使用-e方式传入环境变量TELEGRAM_TOKEN和TZ
+  * 使用-v持久化数据库目录，数据库会在首次运行时自动创建。
+
+#### 🧑🏻‍🦽 自行构建镜像
+1. **克隆仓库**
+
+   ```bash
+   git clone https://github.com/nezhahq/Nezha-Telegram-Bot-V1.git
+   cd Nezha-Telegram-Bot-V1
+   ```
+   
+2. **构建镜像**
+   
+   ```bash
+   docker build -t nezhatgbot-v1 .
+   ```
+   
+3. **创建并运行容器**
+
+   ```bash
+   docker run -d --name nezhatgbot-v1 --restart unless-stopped \
+      -e TELEGRAM_TOKEN="your_telegram_bot_token" \
+      -e TZ="Asia/Shanghai" \
+      -v ~/nezhabot:/app/db \
+      nezhatgbot-v1
+   ```
+
+  * 使用-e方式传入环境变量TELEGRAM_TOKEN和TZ
+  * 使用-v持久化数据库目录，数据库会在首次运行时自动创建。
 
 ## 🛠️ 使用指南
 
