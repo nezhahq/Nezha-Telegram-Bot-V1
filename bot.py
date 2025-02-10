@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 from dateutil import parser
 from dotenv import load_dotenv
+import pytz
 import os
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
@@ -27,7 +28,7 @@ load_dotenv()
 
 # 定义常量和配置
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-DATABASE_PATH = 'users.db'
+DATABASE_PATH = 'db/users.db'
 
 # 定义阶段
 BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD, BIND_ALIAS = range(4)
@@ -38,6 +39,21 @@ GROUP_MESSAGE_LIFETIME = 180  # 3分钟
 
 # 初始化数据库
 db = Database(DATABASE_PATH)
+
+# 添加获取当前时间函数
+def get_localized_time_string():
+    tz_str = os.environ.get('TZ')
+
+    if tz_str:
+        try:
+            tz = pytz.timezone(tz_str)
+            localized_time = datetime.now(tz)
+            return localized_time.strftime('%Y-%m-%d %H:%M:%S %Z%z')
+        except pytz.exceptions.UnknownTimeZoneError:
+            return "Error: Invalid Time Zone in TZ environment variable."
+    else:
+        utc_time = datetime.utcnow()
+        return utc_time.strftime('%Y-%m-%d %H:%M:%S UTC')
 
 # 添加 format_bytes 函数
 def format_bytes(size_in_bytes):
@@ -277,7 +293,7 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
 
-**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+**更新于**： {get_localized_time_string()}
 """
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -503,7 +519,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **流量**： ↓{format_bytes(net_in_transfer)}     ↑{format_bytes(net_out_transfer)}
 **网速**： ↓{format_bytes(net_in_speed)}/s     ↑{format_bytes(net_out_speed)}/s
 
-**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+**更新于**： {get_localized_time_string()}
 """
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data=f"refresh_server_{server_id}")]]
@@ -574,7 +590,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **流量**： ↓{format_bytes(net_in_transfer)}     ↑{format_bytes(net_out_transfer)}
 **网速**： ↓{format_bytes(net_in_speed)}/s     ↑{format_bytes(net_out_speed)}/s
 
-**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+**更新于**： {get_localized_time_string()}
 """
         keyboard = [[InlineKeyboardButton("刷新", callback_data=f"refresh_server_{server_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -618,7 +634,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
 
-**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+**更新于**： {get_localized_time_string()}
 """
             keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -747,7 +763,7 @@ async def view_loop_traffic(query, context, api):
                 response += f"服务器 **{server_name}**：已使用 {transfer_formatted} / {max_transfer_formatted}，已使用 {percentage:.2f}%\n"
             response += "--------------------------\n"
 
-        response += f"**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        response += f"**更新于**： {get_localized_time_string()}"
 
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_loop_traffic")]]
@@ -794,7 +810,7 @@ async def view_availability(query, context, api):
             else:
                 delay_text = ""
             response += f"**{name}**：可用率 {availability:.2f}%，状态 {status}{delay_text}\n------------------\n"
-        response += f"\n**更新于**： {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        response += f"\n**更新于**： {get_localized_time_string()}"
 
         # 添加刷新按钮
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_availability")]]
