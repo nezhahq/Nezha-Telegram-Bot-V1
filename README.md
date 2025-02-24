@@ -73,7 +73,7 @@
 1. **拉取镜像**
 
    ```bash
-   docker pull ghcr.io/utopeadia/nezhatgbot-v1:latest
+   docker pull ghcr.io/nezhahq/nezhatgbot-v1:latest
    ```
 
 2. **创建并运行容器**
