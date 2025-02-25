@@ -83,7 +83,7 @@
       -e TELEGRAM_TOKEN="your_telegram_bot_token" \
       -e TZ="Asia/Shanghai" \
       -v ~/nezhabot:/app/db \
-      ghcr.io/utopeadia/nezhatgbot-v1:latest
+      ghcr.io/nezhahq/nezhatgbot-v1:latest
    ```
 
   * 使用-e方式传入环境变量TELEGRAM_TOKEN和TZ
