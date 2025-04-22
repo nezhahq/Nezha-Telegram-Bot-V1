@@ -29,6 +29,13 @@ load_dotenv()
 # 定义常量和配置
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DATABASE_PATH = 'db/users.db'
+# 从环境变量读取流量告警阈值 (GB)，默认为 0 (不告警)
+UPLOAD_ALERT_THRESHOLD_GB = float(os.getenv('UPLOAD_ALERT_THRESHOLD_GB', 0))
+DOWNLOAD_ALERT_THRESHOLD_GB = float(os.getenv('DOWNLOAD_ALERT_THRESHOLD_GB', 0))
+
+UPLOAD_ALERT_THRESHOLD_BYTES = UPLOAD_ALERT_THRESHOLD_GB * (1024**3)
+DOWNLOAD_ALERT_THRESHOLD_BYTES = DOWNLOAD_ALERT_THRESHOLD_GB * (1024**3)
+
 
 # 定义阶段
 BIND_USERNAME, BIND_PASSWORD, BIND_DASHBOARD, BIND_ALIAS = range(4)
@@ -266,18 +273,69 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data and data.get('success'):
         servers = data['data']
-        online_servers = sum(1 for s in servers if is_online(s))
+        online_servers = 0
+        offline_servers_info = []
+        traffic_alerts = []
         total_servers = len(servers)
-        total_mem = sum(s['host'].get('mem_total', 0) for s in servers if s.get('host'))
-        used_mem = sum(s['state'].get('mem_used', 0) for s in servers if s.get('state'))
-        total_swap = sum(s['host'].get('swap_total', 0) for s in servers if s.get('host'))
-        used_swap = sum(s['state'].get('swap_used', 0) for s in servers if s.get('state'))
-        total_disk = sum(s['host'].get('disk_total', 0) for s in servers if s.get('host'))
-        used_disk = sum(s['state'].get('disk_used', 0) for s in servers if s.get('state'))
-        net_in_speed = sum(s['state'].get('net_in_speed', 0) for s in servers if s.get('state'))
-        net_out_speed = sum(s['state'].get('net_out_speed', 0) for s in servers if s.get('state'))
-        net_in_transfer = sum(s['state'].get('net_in_transfer', 0) for s in servers if s.get('state'))
-        net_out_transfer = sum(s['state'].get('net_out_transfer', 0) for s in servers if s.get('state'))
+        total_mem = 0
+        used_mem = 0
+        total_swap = 0
+        used_swap = 0
+        total_disk = 0
+        used_disk = 0
+        net_in_speed = 0
+        net_out_speed = 0
+        net_in_transfer = 0
+        net_out_transfer = 0
+
+        for s in servers:
+            server_name = s.get('name', '未知')
+            if is_online(s):
+                online_servers += 1
+            else:
+                last_active_str = s.get('last_active')
+                last_active_formatted = "未知时间"
+                if last_active_str:
+                    try:
+                        # 解析时间并转换为本地时区（如果设置了TZ）
+                        last_active_dt_utc = parser.isoparse(last_active_str).astimezone(timezone.utc)
+                        tz_str = os.environ.get('TZ')
+                        if tz_str:
+                            try:
+                                target_tz = pytz.timezone(tz_str)
+                                last_active_dt_local = last_active_dt_utc.astimezone(target_tz)
+                                last_active_formatted = last_active_dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')
+                            except pytz.exceptions.UnknownTimeZoneError:
+                                last_active_formatted = last_active_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+                        else:
+                             last_active_formatted = last_active_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+                    except ValueError:
+                        last_active_formatted = "无效时间格式"
+                offline_servers_info.append(f"服务器 **{server_name}** 离线，最后在线: {last_active_formatted}")
+
+            # 累加统计信息
+            if s.get('host'):
+                total_mem += s['host'].get('mem_total', 0)
+                total_swap += s['host'].get('swap_total', 0)
+                total_disk += s['host'].get('disk_total', 0)
+            if s.get('state'):
+                used_mem += s['state'].get('mem_used', 0)
+                used_swap += s['state'].get('swap_used', 0)
+                used_disk += s['state'].get('disk_used', 0)
+                net_in_speed += s['state'].get('net_in_speed', 0)
+                net_out_speed += s['state'].get('net_out_speed', 0)
+                current_net_in = s['state'].get('net_in_transfer', 0)
+                current_net_out = s['state'].get('net_out_transfer', 0)
+                net_in_transfer += current_net_in
+                net_out_transfer += current_net_out
+
+                # 检查流量阈值
+                if UPLOAD_ALERT_THRESHOLD_BYTES > 0 and current_net_out > UPLOAD_ALERT_THRESHOLD_BYTES:
+                    traffic_alerts.append(f"服务器 **{server_name}** 上行流量超限: {format_bytes(current_net_out)} / {format_bytes(UPLOAD_ALERT_THRESHOLD_BYTES)}")
+                if DOWNLOAD_ALERT_THRESHOLD_BYTES > 0 and current_net_in > DOWNLOAD_ALERT_THRESHOLD_BYTES:
+                    traffic_alerts.append(f"服务器 **{server_name}** 下行流量超限: {format_bytes(current_net_in)} / {format_bytes(DOWNLOAD_ALERT_THRESHOLD_BYTES)}")
+
+
         transfer_ratio = (net_out_transfer / net_in_transfer * 100) if net_in_transfer else 0
 
         response = f"""📊 **统计信息**
@@ -292,9 +350,19 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **下行流量**： ↓{format_bytes(net_in_transfer)}
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
-
-**更新于**： {get_localized_time_string()}
 """
+        # 添加流量告警信息
+        if traffic_alerts:
+            response += "\n\n🚨 **流量告警**\n===========================\n"
+            response += "\n".join(traffic_alerts)
+
+        # 添加离线设备信息
+        if offline_servers_info:
+            response += "\n\n🔌 **离线设备**\n===========================\n"
+            response += "\n".join(offline_servers_info)
+
+        response += f"\n\n**更新于**： {get_localized_time_string()}"
+
         keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await send_message_with_auto_delete(
@@ -607,18 +675,68 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data and data.get('success'):
             servers = data['data']
+            online_servers = 0
+            offline_servers_info = []
+            traffic_alerts = []
             total_servers = len(servers)
-            online_servers = sum(1 for s in servers if is_online(s))
-            total_mem = sum(s['host'].get('mem_total', 0) for s in servers if s.get('host'))
-            used_mem = sum(s['state'].get('mem_used', 0) for s in servers if s.get('state'))
-            total_swap = sum(s['host'].get('swap_total', 0) for s in servers if s.get('host'))
-            used_swap = sum(s['state'].get('swap_used', 0) for s in servers if s.get('state'))
-            total_disk = sum(s['host'].get('disk_total', 0) for s in servers if s.get('host'))
-            used_disk = sum(s['state'].get('disk_used', 0) for s in servers if s.get('state'))
-            net_in_speed = sum(s['state'].get('net_in_speed', 0) for s in servers if s.get('state'))
-            net_out_speed = sum(s['state'].get('net_out_speed', 0) for s in servers if s.get('state'))
-            net_in_transfer = sum(s['state'].get('net_in_transfer', 0) for s in servers if s.get('state'))
-            net_out_transfer = sum(s['state'].get('net_out_transfer', 0) for s in servers if s.get('state'))
+            total_mem = 0
+            used_mem = 0
+            total_swap = 0
+            used_swap = 0
+            total_disk = 0
+            used_disk = 0
+            net_in_speed = 0
+            net_out_speed = 0
+            net_in_transfer = 0
+            net_out_transfer = 0
+
+            for s in servers:
+                server_name = s.get('name', '未知')
+                if is_online(s):
+                    online_servers += 1
+                else:
+                    last_active_str = s.get('last_active')
+                    last_active_formatted = "未知时间"
+                    if last_active_str:
+                        try:
+                            # 解析时间并转换为本地时区（如果设置了TZ）
+                            last_active_dt_utc = parser.isoparse(last_active_str).astimezone(timezone.utc)
+                            tz_str = os.environ.get('TZ')
+                            if tz_str:
+                                try:
+                                    target_tz = pytz.timezone(tz_str)
+                                    last_active_dt_local = last_active_dt_utc.astimezone(target_tz)
+                                    last_active_formatted = last_active_dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')
+                                except pytz.exceptions.UnknownTimeZoneError:
+                                    last_active_formatted = last_active_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+                            else:
+                                 last_active_formatted = last_active_dt_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+                        except ValueError:
+                            last_active_formatted = "无效时间格式"
+                    offline_servers_info.append(f"服务器 **{server_name}** 离线，最后在线: {last_active_formatted}")
+
+                # 累加统计信息
+                if s.get('host'):
+                    total_mem += s['host'].get('mem_total', 0)
+                    total_swap += s['host'].get('swap_total', 0)
+                    total_disk += s['host'].get('disk_total', 0)
+                if s.get('state'):
+                    used_mem += s['state'].get('mem_used', 0)
+                    used_swap += s['state'].get('swap_used', 0)
+                    used_disk += s['state'].get('disk_used', 0)
+                    net_in_speed += s['state'].get('net_in_speed', 0)
+                    net_out_speed += s['state'].get('net_out_speed', 0)
+                    current_net_in = s['state'].get('net_in_transfer', 0)
+                    current_net_out = s['state'].get('net_out_transfer', 0)
+                    net_in_transfer += current_net_in
+                    net_out_transfer += current_net_out
+
+                    # 检查流量阈值
+                    if UPLOAD_ALERT_THRESHOLD_BYTES > 0 and current_net_out > UPLOAD_ALERT_THRESHOLD_BYTES:
+                        traffic_alerts.append(f"服务器 **{server_name}** 上行流量超限: {format_bytes(current_net_out)} / {format_bytes(UPLOAD_ALERT_THRESHOLD_BYTES)}")
+                    if DOWNLOAD_ALERT_THRESHOLD_BYTES > 0 and current_net_in > DOWNLOAD_ALERT_THRESHOLD_BYTES:
+                        traffic_alerts.append(f"服务器 **{server_name}** 下行流量超限: {format_bytes(current_net_in)} / {format_bytes(DOWNLOAD_ALERT_THRESHOLD_BYTES)}")
+
             transfer_ratio = (net_out_transfer / net_in_transfer * 100) if net_in_transfer else 0
 
             response = f"""📊 **统计信息**
@@ -633,11 +751,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **下行流量**： ↓{format_bytes(net_in_transfer)}
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
-
-**更新于**： {get_localized_time_string()}
 """
+            # 添加流量告警信息
+            if traffic_alerts:
+                response += "\n\n🚨 **流量告警**\n===========================\n"
+                response += "\n".join(traffic_alerts)
+
+            # 添加离线设备信息
+            if offline_servers_info:
+                response += "\n\n🔌 **离线设备**\n===========================\n"
+                response += "\n".join(offline_servers_info)
+
+            response += f"\n\n**更新于**： {get_localized_time_string()}"
+
             keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
+            # 使用 edit_message_with_auto_delete 而不是 send_message_with_auto_delete
             await edit_message_with_auto_delete(query, response, parse_mode='Markdown', reply_markup=reply_markup)
         else:
             await edit_message_with_auto_delete(query, "获取服务器信息失败。")
