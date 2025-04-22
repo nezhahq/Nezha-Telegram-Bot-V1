@@ -351,15 +351,15 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
 """
-        # 添加流量告警信息
-        if traffic_alerts:
-            response += "\n\n🚨 **流量告警**\n===========================\n"
-            response += "\n".join(traffic_alerts)
-
         # 添加离线设备信息
         if offline_servers_info:
             response += "\n\n🔌 **离线设备**\n===========================\n"
             response += "\n".join(offline_servers_info)
+
+        # 添加流量告警信息
+        if traffic_alerts:
+            response += "\n\n🚨 **流量告警**\n===========================\n"
+            response += "\n".join(traffic_alerts)        
 
         response += f"\n\n**更新于**： {get_localized_time_string()}"
 
@@ -752,15 +752,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **上行流量**： ↑{format_bytes(net_out_transfer)}
 **流量对等性**： {transfer_ratio:.1f}%
 """
+            # 添加离线设备信息
+            if offline_servers_info:
+                response += "\n\n🔌 **离线设备**\n===========================\n"
+                response += "\n".join(offline_servers_info)
+                
             # 添加流量告警信息
             if traffic_alerts:
                 response += "\n\n🚨 **流量告警**\n===========================\n"
                 response += "\n".join(traffic_alerts)
 
-            # 添加离线设备信息
-            if offline_servers_info:
-                response += "\n\n🔌 **离线设备**\n===========================\n"
-                response += "\n".join(offline_servers_info)
 
             response += f"\n\n**更新于**： {get_localized_time_string()}"
 
