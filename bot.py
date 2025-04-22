@@ -335,7 +335,7 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     target_tz
                                 )
                                 last_active_formatted = last_active_dt_local.strftime(
-                                    "%Y-%m-%d %H:%M:%S %Z"
+                                    "%Y-%m-%d %H:%M:%S %Z%z"
                                 )
                             except pytz.exceptions.UnknownTimeZoneError:
                                 last_active_formatted = last_active_dt_utc.strftime(
