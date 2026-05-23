@@ -1,5 +1,5 @@
 # database.py
-
+from pathlib import Path
 import aiosqlite
 
 class Database:
@@ -7,6 +7,11 @@ class Database:
         self.db_path = db_path
 
     async def initialize(self):
+
+        db_file = Path(self.db_path)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        # 创建数据库目录
+
         async with aiosqlite.connect(self.db_path) as db:
             # 创建用户表
             await db.execute('''
