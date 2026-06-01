@@ -1,4 +1,6 @@
 # database.py
+import json
+import time
 from pathlib import Path
 import aiosqlite
 
@@ -57,6 +59,18 @@ class Database:
                     dashboard_id INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
+                    FOREIGN KEY (dashboard_id) REFERENCES dashboards (id)
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS llm_sessions (
+                    telegram_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_thread_id INTEGER NOT NULL DEFAULT 0,
+                    dashboard_id INTEGER NOT NULL,
+                    history_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (telegram_id, chat_id, message_thread_id, dashboard_id),
                     FOREIGN KEY (dashboard_id) REFERENCES dashboards (id)
                 )
             ''')
@@ -247,6 +261,61 @@ class Database:
             await db.execute('DELETE FROM pending_executions WHERE id = ?', (execution_id,))
             await db.commit()
 
+    async def get_llm_history(self, telegram_id, chat_id, message_thread_id, dashboard_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('''
+                SELECT history_json
+                FROM llm_sessions
+                WHERE telegram_id = ?
+                  AND chat_id = ?
+                  AND message_thread_id = ?
+                  AND dashboard_id = ?
+            ''', (telegram_id, chat_id, message_thread_id or 0, dashboard_id)) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return []
+                try:
+                    history = json.loads(row[0])
+                except (TypeError, json.JSONDecodeError):
+                    return []
+                return history if isinstance(history, list) else []
+
+    async def save_llm_history(self, telegram_id, chat_id, message_thread_id, dashboard_id, history):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                INSERT INTO llm_sessions (
+                    telegram_id, chat_id, message_thread_id, dashboard_id, history_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(telegram_id, chat_id, message_thread_id, dashboard_id)
+                DO UPDATE SET
+                    history_json=excluded.history_json,
+                    updated_at=excluded.updated_at
+            ''', (
+                telegram_id,
+                chat_id,
+                message_thread_id or 0,
+                dashboard_id,
+                json.dumps(history or [], ensure_ascii=False, separators=(',', ':')),
+                int(time.time()),
+            ))
+            await db.commit()
+
+    async def reset_llm_session(self, telegram_id, chat_id, message_thread_id, dashboard_id):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                DELETE FROM llm_sessions
+                WHERE telegram_id = ?
+                  AND chat_id = ?
+                  AND message_thread_id = ?
+                  AND dashboard_id = ?
+            ''', (telegram_id, chat_id, message_thread_id or 0, dashboard_id))
+            await db.execute('''
+                DELETE FROM pending_executions
+                WHERE telegram_id = ? AND dashboard_id = ?
+            ''', (telegram_id, dashboard_id))
+            await db.commit()
+
     async def set_default_dashboard(self, telegram_id, dashboard_id):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
@@ -274,6 +343,7 @@ class Database:
             ''', (dashboard_id, telegram_id))
             await db.execute('DELETE FROM llm_configs WHERE dashboard_id = ? AND telegram_id = ?', (dashboard_id, telegram_id))
             await db.execute('DELETE FROM pending_executions WHERE dashboard_id = ? AND telegram_id = ?', (dashboard_id, telegram_id))
+            await db.execute('DELETE FROM llm_sessions WHERE dashboard_id = ? AND telegram_id = ?', (dashboard_id, telegram_id))
             
             # 检查是否还有其他面板
             async with db.execute('''
@@ -305,6 +375,7 @@ class Database:
             await db.execute('DELETE FROM dashboards WHERE telegram_id = ?', (telegram_id,))
             await db.execute('DELETE FROM llm_configs WHERE telegram_id = ?', (telegram_id,))
             await db.execute('DELETE FROM pending_executions WHERE telegram_id = ?', (telegram_id,))
+            await db.execute('DELETE FROM llm_sessions WHERE telegram_id = ?', (telegram_id,))
             # 删除用户
             await db.execute('DELETE FROM users WHERE telegram_id = ?', (telegram_id,))
             await db.commit()
