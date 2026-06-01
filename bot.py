@@ -7,6 +7,7 @@ from dateutil import parser
 from dotenv import load_dotenv
 import pytz
 import os
+import secrets
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import (
@@ -21,6 +22,19 @@ from telegram.ext import (
 
 from nezha_api import NezhaAPI
 from database import Database
+from llm_assistant import (
+    deserialize_pending_execution,
+    redact_secret,
+    run_assistant_message,
+    serialize_pending_execution,
+)
+from server_utils import (
+    attach_group_ids,
+    compact_server_status,
+    filter_servers,
+    paginate_servers,
+    sort_servers_for_display,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -50,6 +64,24 @@ GROUP_MESSAGE_LIFETIME = 180  # 3分钟
 
 # 初始化数据库
 db = Database(DATABASE_PATH)
+
+
+def create_api(dashboard):
+    return NezhaAPI(
+        dashboard["dashboard_url"],
+        dashboard.get("username"),
+        dashboard.get("password"),
+        auth_type=dashboard.get("auth_type", "password"),
+        api_token=dashboard.get("api_token"),
+    )
+
+
+def dashboard_auth_text(dashboard):
+    if dashboard.get("auth_type") == "token":
+        return "API Token"
+    if dashboard.get("api_token"):
+        return "用户名/密码（API Token 已绑定）"
+    return "用户名/密码"
 
 
 # 添加获取当前时间函数
@@ -183,8 +215,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /dashboard - 管理面板
 /overview - 查看服务器状态总览
 /server - 查看单台服务器状态
+/servers - 服务器搜索入口
 /cron - 执行计划任务
 /services - 查看服务状态总览
+/chat - LLM 运维助手
+/mcp - 面板设置 / MCP 快捷入口
 /help - 获取帮助
         """,
     )
@@ -198,14 +233,23 @@ async def bind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # 在私聊中直接使用 reply_text
-    await update.message.reply_text("请输入您的用户名：")
+    await update.message.reply_text("请输入您的用户名，或直接发送 API Token（nzp_...）：")
     return BIND_USERNAME
 
 
 async def bind_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["username"] = update.message.text.strip()
-    # 在私聊中直接使用 reply_text
+    value = update.message.text.strip()
+    if value.startswith("nzp_"):
+        context.user_data["auth_type"] = "token"
+        context.user_data["api_token"] = value
+        context.user_data["username"] = ""
+        context.user_data["password"] = ""
+        await update.message.reply_text(
+            "请输入您的 Dashboard 地址（例如：https://nezha.example.com）："
+        )
+        return BIND_DASHBOARD
+    context.user_data["auth_type"] = "password"
+    context.user_data["username"] = value
     await update.message.reply_text("请输入您的密码：")
     return BIND_PASSWORD
 
@@ -234,18 +278,34 @@ async def bind_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = context.user_data["username"]
     password = context.user_data["password"]
     dashboard_url = context.user_data["dashboard_url"]
+    auth_type = context.user_data.get("auth_type", "password")
+    api_token = context.user_data.get("api_token")
 
     # 测试连接
     try:
-        api = NezhaAPI(dashboard_url, username, password)
-        await api.authenticate()
+        api = NezhaAPI(
+            dashboard_url,
+            username,
+            password,
+            auth_type=auth_type,
+            api_token=api_token,
+        )
+        await api.validate_auth()
         await api.close()
     except Exception as e:
         await update.message.reply_text(f"绑定失败：{e}\n请检查您的信息并重新绑定。")
         return ConversationHandler.END
 
     # 保存到数据库
-    await db.add_user(telegram_id, username, password, dashboard_url, alias)
+    await db.add_user(
+        telegram_id,
+        username,
+        password,
+        dashboard_url,
+        alias,
+        auth_type=auth_type,
+        api_token=api_token,
+    )
     await update.message.reply_text("绑定成功！您现在可以使用机器人的功能了。")
     return ConversationHandler.END
 
@@ -289,7 +349,7 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    api = NezhaAPI(user["dashboard_url"], user["username"], user["password"])
+    api = create_api(user)
     try:
         data = await api.get_overview()
     except Exception as e:
@@ -412,7 +472,10 @@ async def overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         response += f"\n\n**更新于**： {get_localized_time_string()}"
 
-        keyboard = [[InlineKeyboardButton("刷新", callback_data="refresh_overview")]]
+        keyboard = [
+            [InlineKeyboardButton("刷新", callback_data="refresh_overview")],
+            [InlineKeyboardButton("切换面板", callback_data="dashboard_back")],
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await send_message_with_auto_delete(
             update, context, response, parse_mode="Markdown", reply_markup=reply_markup
@@ -430,6 +493,15 @@ async def server_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if context.args:
+        await send_server_search_results(
+            update,
+            context,
+            " ".join(context.args),
+            page=1,
+        )
+        return ConversationHandler.END
+
     await send_message_with_auto_delete(
         update, context, "请输入要查询的服务器名称（支持模糊搜索）："
     )
@@ -438,30 +510,89 @@ async def server_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text.strip()
+    await send_server_search_results(update, context, query_text, page=1)
+    return ConversationHandler.END
+
+
+async def servers_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await db.get_user(update.effective_user.id)
-    api = NezhaAPI(user["dashboard_url"], user["username"], user["password"])
+    if not user:
+        await send_message_with_auto_delete(
+            update, context, "请先使用 /bind 命令绑定您的账号。"
+        )
+        return
+    if context.args:
+        await send_server_search_results(update, context, " ".join(context.args), page=1)
+        return
+    keyboard = [
+        [InlineKeyboardButton("搜索", callback_data="servers_mode_search")],
+        [
+            InlineKeyboardButton("在线", callback_data="servers_filter_online"),
+            InlineKeyboardButton("离线", callback_data="servers_filter_offline"),
+        ],
+        [
+            InlineKeyboardButton("高负载", callback_data="servers_filter_load"),
+            InlineKeyboardButton("高流量", callback_data="servers_filter_traffic"),
+        ],
+        [InlineKeyboardButton("返回主菜单", callback_data="dashboard_back")],
+    ]
+    await send_message_with_auto_delete(
+        update,
+        context,
+        "请选择服务器查看方式：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def send_server_search_results(update, context, query_text="", page=1, status="all", high_load=False, high_traffic=False):
+    user = await db.get_user(update.effective_user.id)
+    api = create_api(user)
     try:
-        results = await api.search_servers(query_text)
+        data = await api.get_servers()
+        servers = data.get("data", []) if data and data.get("success") else []
+        results = filter_servers(
+            servers,
+            query=query_text,
+            status=status,
+            high_load=high_load,
+            high_traffic=high_traffic,
+        )
     except Exception as e:
         await send_message_with_auto_delete(update, context, f"搜索失败：{e}")
         await api.close()
-        return ConversationHandler.END
+        return
+    await api.close()
 
     if not results:
         await send_message_with_auto_delete(update, context, "未找到匹配的服务器。")
-        await api.close()
-        return ConversationHandler.END
+        return
 
-    keyboard = [
-        [InlineKeyboardButton(s["name"], callback_data=f"server_detail_{s['id']}")]
-        for s in results
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await send_message_with_auto_delete(
-        update, context, "请选择服务器：", reply_markup=reply_markup
-    )
-    await api.close()
-    return ConversationHandler.END
+    context.user_data["server_search"] = {
+        "query": query_text,
+        "status": status,
+        "high_load": high_load,
+        "high_traffic": high_traffic,
+    }
+    text, reply_markup = build_server_results_message(results, page)
+    await send_message_with_auto_delete(update, context, text, reply_markup=reply_markup)
+
+
+def build_server_results_message(results, page):
+    page_data = paginate_servers(sort_servers_for_display(results), page=page, per_page=8)
+    keyboard = []
+    for server in page_data["items"]:
+        label = f"{server.get('name', '未知')} | {compact_server_status(server)}"
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"server_detail_{server['id']}")])
+    nav = []
+    if page_data["page"] > 1:
+        nav.append(InlineKeyboardButton("上一页", callback_data=f"srvpg_{page_data['page'] - 1}"))
+    if page_data["page"] < page_data["total_pages"]:
+        nav.append(InlineKeyboardButton("下一页", callback_data=f"srvpg_{page_data['page'] + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("返回", callback_data="servers_entry")])
+    text = f"请选择服务器（{page_data['page']}/{page_data['total_pages']}，共 {page_data['total']} 台）："
+    return text, InlineKeyboardMarkup(keyboard)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,7 +686,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton(
                         button_text, callback_data=f"set_default_{dashboard['id']}"
-                    )
+                    ),
+                    InlineKeyboardButton("设置", callback_data=f"settings_{dashboard['id']}")
                 ]
             )
 
@@ -563,6 +695,106 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_message_with_auto_delete(
             query, "您的面板列表：", reply_markup=reply_markup
         )
+        return
+
+    elif data.startswith("settings_"):
+        if query.message.chat.type != "private":
+            await query.answer("请在私聊中设置 MCP/LLM。", show_alert=True)
+            return
+        await query.answer()
+        parts = data.split("_")
+        action = "view" if len(parts) == 2 else parts[1]
+        dashboard_id = int(parts[-1])
+        dashboard_row = await db.get_dashboard(query.from_user.id, dashboard_id)
+        if not dashboard_row:
+            await edit_message_with_auto_delete(query, "未找到该面板。")
+            return
+        if action == "view":
+            llm_config = await db.get_llm_config(query.from_user.id, dashboard_id)
+            auth_text = dashboard_auth_text(dashboard_row)
+            token_text = redact_secret(dashboard_row.get("api_token"))
+            llm_text = "已启用" if llm_config and llm_config.get("enabled") and llm_config.get("api_key") else "未配置"
+            text = (
+                f"面板设置：{dashboard_row.get('alias') or 'NEZHA'}\n"
+                f"URL：{dashboard_row.get('dashboard_url')}\n"
+                f"认证：{auth_text}\n"
+                f"API Token：{token_text}\n"
+                f"LLM/MCP 助手：{llm_text}\n\n"
+                "提示：完整使用建议授予 nezha:inventory:read、nezha:service:read、nezha:cron:read、nezha:cron:exec、nezha:server:exec；需要 MCP 读取单机详情时再加 nezha:server:read，并限制服务器白名单。"
+            )
+            keyboard = [
+                [InlineKeyboardButton("测试连接", callback_data=f"settings_test_{dashboard_id}")],
+                [InlineKeyboardButton("绑定/更换 API Token", callback_data=f"settings_token_{dashboard_id}")],
+                [InlineKeyboardButton("配置 LLM", callback_data=f"settings_llm_{dashboard_id}")],
+                [InlineKeyboardButton("返回面板列表", callback_data="dashboard_back")],
+            ]
+            await edit_message_with_auto_delete(query, text, reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        if action == "test":
+            api = create_api(dashboard_row)
+            try:
+                ok = await api.validate_auth()
+            except Exception as e:
+                await edit_message_with_auto_delete(query, f"连接失败：{e}")
+                await api.close()
+                return
+            await api.close()
+            await edit_message_with_auto_delete(query, "连接测试成功。" if ok else "连接测试失败。")
+            return
+        if action == "token":
+            context.user_data["settings_waiting"] = {"type": "token", "dashboard_id": dashboard_id}
+            await edit_message_with_auto_delete(query, "请发送新的 API Token（nzp_...）。")
+            return
+        if action == "llm":
+            context.user_data["settings_waiting"] = {"type": "llm", "dashboard_id": dashboard_id}
+            await edit_message_with_auto_delete(
+                query,
+                "请按三行发送 LLM 配置：\nbase_url\nmodel\napi_key\n\n例如：\nhttps://api.openai.com/v1\ngpt-4o-mini\nsk-...",
+            )
+            return
+        await edit_message_with_auto_delete(query, "未知设置操作。")
+        return
+
+    elif data.startswith("exec_cancel_"):
+        await query.answer()
+        execution_id = data.split("exec_cancel_", 1)[1]
+        await db.delete_pending_execution(execution_id)
+        await edit_message_with_auto_delete(query, "操作已取消。")
+        return
+
+    elif data.startswith("exec_confirm_"):
+        if query.message.chat.type != "private":
+            await query.answer("命令执行只允许在私聊中确认。", show_alert=True)
+            return
+        await query.answer()
+        execution_id = data.split("exec_confirm_", 1)[1]
+        row = await db.get_pending_execution(execution_id)
+        if not row or row["telegram_id"] != query.from_user.id:
+            await edit_message_with_auto_delete(query, "确认已过期或无权限。")
+            return
+        pending = deserialize_pending_execution(row["payload"])
+        dashboard_row = await db.get_dashboard(query.from_user.id, pending.dashboard_id)
+        if not dashboard_row:
+            await edit_message_with_auto_delete(query, "未找到面板绑定。")
+            return
+        if not dashboard_row.get("api_token"):
+            await edit_message_with_auto_delete(query, "MCP 命令执行需要 API Token 认证，请先在设置页绑定 nzp_ Token。")
+            return
+        api = create_api(dashboard_row)
+        lines = [f"开始执行：{pending.command}", ""]
+        try:
+            for server_id, server_name in zip(pending.server_ids, pending.server_names):
+                try:
+                    result = await api.execute_command_mcp(server_id, pending.command)
+                    output = api.format_mcp_exec_output(result)
+                    first_line = output.strip().splitlines()[0] if output.strip() else "已完成"
+                    lines.append(f"✅ {server_name}: {first_line[:80]}")
+                except Exception as e:
+                    lines.append(f"❌ {server_name}: {str(e)[:120]}")
+        finally:
+            await api.close()
+            await db.delete_pending_execution(execution_id)
+        await edit_message_with_auto_delete(query, "\n".join(lines))
         return
 
     user = await db.get_user(query.from_user.id)
@@ -582,7 +814,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    api = NezhaAPI(user["dashboard_url"], user["username"], user["password"])
+    api = create_api(user)
+
+    if data == "servers_entry":
+        keyboard = [
+            [InlineKeyboardButton("搜索", callback_data="servers_mode_search")],
+            [
+                InlineKeyboardButton("在线", callback_data="servers_filter_online"),
+                InlineKeyboardButton("离线", callback_data="servers_filter_offline"),
+            ],
+            [
+                InlineKeyboardButton("高负载", callback_data="servers_filter_load"),
+                InlineKeyboardButton("高流量", callback_data="servers_filter_traffic"),
+            ],
+            [InlineKeyboardButton("返回主菜单", callback_data="dashboard_back")],
+        ]
+        await api.close()
+        await edit_message_with_auto_delete(
+            query, "请选择服务器查看方式：", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "servers_mode_search":
+        await api.close()
+        await edit_message_with_auto_delete(
+            query, "请直接发送 /server 关键词 或 /servers 关键词 搜索服务器。"
+        )
+        return
+
+    if data.startswith("servers_filter_") or data.startswith("srvpg_"):
+        params = context.user_data.get("server_search", {})
+        if data.startswith("servers_filter_"):
+            mode = data.split("_")[-1]
+            params = {
+                "query": "",
+                "status": "online" if mode == "online" else "offline" if mode == "offline" else "all",
+                "high_load": mode == "load",
+                "high_traffic": mode == "traffic",
+            }
+            context.user_data["server_search"] = params
+            page = 1
+        else:
+            page = int(data.split("_")[-1])
+        try:
+            server_data = await api.get_servers()
+            servers = server_data.get("data", []) if server_data and server_data.get("success") else []
+            results = filter_servers(servers, **params)
+        except Exception as e:
+            await api.close()
+            await edit_message_with_auto_delete(query, f"搜索失败：{e}")
+            return
+        await api.close()
+        if not results:
+            await edit_message_with_auto_delete(query, "未找到匹配的服务器。")
+            return
+        text, reply_markup = build_server_results_message(results, page)
+        await edit_message_with_auto_delete(query, text, reply_markup=reply_markup)
+        return
 
     if data.startswith("server_detail_"):
         server_id = int(data.split("_")[-1])
@@ -866,7 +1154,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += f"\n\n**更新于**： {get_localized_time_string()}"
 
             keyboard = [
-                [InlineKeyboardButton("刷新", callback_data="refresh_overview")]
+                [InlineKeyboardButton("刷新", callback_data="refresh_overview")],
+                [InlineKeyboardButton("切换面板", callback_data="dashboard_back")],
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             # 使用 edit_message_with_auto_delete 而不是 send_message_with_auto_delete
@@ -878,6 +1167,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await api.close()
 
     elif data.startswith("cron_job_"):
+        await api.close()
         cron_id = int(data.split("_")[-1])
         keyboard = [
             [InlineKeyboardButton("确认执行", callback_data=f"confirm_cron_{cron_id}")],
@@ -905,6 +1195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_message_with_auto_delete(query, "执行失败。")
 
     elif data == "cancel":
+        await api.close()
         await edit_message_with_auto_delete(query, "操作已取消。")
 
     elif data == "view_loop_traffic":
@@ -921,6 +1212,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("set_default_"):
         dashboard_id = int(data.split("_")[-1])
+        await api.close()
         await db.set_default_dashboard(query.from_user.id, dashboard_id)
         await edit_message_with_auto_delete(query, "已更新默认面板。")
         return
@@ -953,7 +1245,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton(
                         button_text, callback_data=f"set_default_{dashboard['id']}"
-                    )
+                    ),
+                    InlineKeyboardButton("设置", callback_data=f"settings_{dashboard['id']}")
                 ]
             )
 
@@ -964,6 +1257,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "dashboard_back":
+        await api.close()
         # 返回面板列表
         dashboards = await db.get_all_dashboards(query.from_user.id)
         keyboard = []
@@ -974,7 +1268,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     InlineKeyboardButton(
                         button_text, callback_data=f"set_default_{dashboard['id']}"
-                    )
+                    ),
+                    InlineKeyboardButton("设置", callback_data=f"settings_{dashboard['id']}")
                 ]
             )
 
@@ -1095,7 +1390,7 @@ async def cron_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    api = NezhaAPI(user["dashboard_url"], user["username"], user["password"])
+    api = create_api(user)
     try:
         data = await api.get_cron_jobs()
     except Exception as e:
@@ -1134,6 +1429,7 @@ async def services_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("查看循环流量信息", callback_data="view_loop_traffic")],
         [InlineKeyboardButton("查看可用性监测信息", callback_data="view_availability")],
+        [InlineKeyboardButton("切换面板", callback_data="dashboard_back")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await send_message_with_auto_delete(
@@ -1155,6 +1451,9 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton(
                     button_text, callback_data=f"set_default_{dashboard['id']}"
+                ),
+                InlineKeyboardButton(
+                    "设置", callback_data=f"settings_{dashboard['id']}"
                 )
             ]
         )
@@ -1163,6 +1462,155 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_message_with_auto_delete(
         update, context, "您的面板列表：", reply_markup=reply_markup
     )
+
+
+async def mcp_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await send_message_with_auto_delete(update, context, "MCP/LLM 设置和执行命令请在私聊中使用。")
+        return
+    dashboards = await db.get_all_dashboards(update.effective_user.id)
+    if not dashboards:
+        await send_message_with_auto_delete(update, context, "请先使用 /bind 命令绑定您的账号。")
+        return
+    if len(dashboards) == 1:
+        await send_dashboard_settings(update, context, dashboards[0]["id"])
+        return
+    keyboard = [
+        [InlineKeyboardButton(d["alias"] or d["dashboard_url"], callback_data=f"settings_{d['id']}")]
+        for d in dashboards
+    ]
+    await send_message_with_auto_delete(
+        update, context, "请选择要设置的面板：", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def send_dashboard_settings(update, context, dashboard_id):
+    dashboard_row = await db.get_dashboard(update.effective_user.id, int(dashboard_id))
+    if not dashboard_row:
+        await send_message_with_auto_delete(update, context, "未找到该面板。")
+        return
+    llm_config = await db.get_llm_config(update.effective_user.id, int(dashboard_id))
+    auth_text = dashboard_auth_text(dashboard_row)
+    token_text = redact_secret(dashboard_row.get("api_token"))
+    llm_text = "已启用" if llm_config and llm_config.get("enabled") and llm_config.get("api_key") else "未配置"
+    text = (
+        f"面板设置：{dashboard_row.get('alias') or 'NEZHA'}\n"
+        f"URL：{dashboard_row.get('dashboard_url')}\n"
+        f"认证：{auth_text}\n"
+        f"API Token：{token_text}\n"
+        f"LLM/MCP 助手：{llm_text}\n\n"
+        "提示：完整使用建议授予 nezha:inventory:read、nezha:service:read、nezha:cron:read、nezha:cron:exec、nezha:server:exec；需要 MCP 读取单机详情时再加 nezha:server:read，并限制服务器白名单。"
+    )
+    keyboard = [
+        [InlineKeyboardButton("测试连接", callback_data=f"settings_test_{dashboard_id}")],
+        [InlineKeyboardButton("绑定/更换 API Token", callback_data=f"settings_token_{dashboard_id}")],
+        [InlineKeyboardButton("配置 LLM", callback_data=f"settings_llm_{dashboard_id}")],
+        [InlineKeyboardButton("返回面板列表", callback_data="dashboard_back")],
+    ]
+    await send_message_with_auto_delete(update, context, text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    waiting = context.user_data.get("settings_waiting")
+    if not waiting:
+        return
+    if update.effective_chat.type != "private":
+        return
+    value = update.message.text.strip()
+    dashboard_id = int(waiting["dashboard_id"])
+    if waiting["type"] == "token":
+        if not value.startswith("nzp_"):
+            await update.message.reply_text("API Token 格式应以 nzp_ 开头，已取消。")
+            context.user_data.pop("settings_waiting", None)
+            return
+        dashboard_row = await db.get_dashboard(update.effective_user.id, dashboard_id)
+        api = NezhaAPI(dashboard_row["dashboard_url"], auth_type="token", api_token=value)
+        try:
+            await api.validate_api_token()
+        except Exception as e:
+            await update.message.reply_text(f"Token 验证失败：{e}")
+            await api.close()
+            context.user_data.pop("settings_waiting", None)
+            return
+        await api.close()
+        await db.update_dashboard_token(update.effective_user.id, dashboard_id, value)
+        await update.message.reply_text("API Token 已保存，可用于 LLM/MCP 命令执行。")
+        context.user_data.pop("settings_waiting", None)
+        return
+    if waiting["type"] == "llm":
+        parts = [p.strip() for p in value.splitlines() if p.strip()]
+        if len(parts) < 3:
+            await update.message.reply_text("LLM 配置需要三行：base_url、model、api_key。")
+            return
+        await db.upsert_llm_config(
+            update.effective_user.id,
+            dashboard_id,
+            base_url=parts[0],
+            model=parts[1],
+            api_key=parts[2],
+            enabled=True,
+        )
+        await update.message.reply_text("LLM 配置已保存。")
+        context.user_data.pop("settings_waiting", None)
+
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await send_message_with_auto_delete(update, context, "LLM 运维助手和命令执行请在私聊中使用。")
+        return
+    dashboard_row = await db.get_user(update.effective_user.id)
+    if not dashboard_row:
+        await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
+        return
+    user_text = " ".join(context.args).strip()
+    if not user_text:
+        await update.message.reply_text("请在 /chat 后面写你的请求，例如：/chat 在 hk 分组执行 `apt-get update`")
+        return
+    llm_config = await db.get_llm_config(update.effective_user.id, dashboard_row["id"])
+    api = create_api(dashboard_row)
+    try:
+        result = await run_assistant_message(
+            db, update.effective_user.id, dashboard_row, api, llm_config, user_text
+        )
+    except Exception as e:
+        await update.message.reply_text(f"助手处理失败：{e}")
+        await api.close()
+        return
+    await api.close()
+    pending = result.get("pending_execution")
+    if pending:
+        execution_id = secrets.token_urlsafe(8)
+        await db.save_pending_execution(
+            execution_id,
+            update.effective_user.id,
+            pending.dashboard_id,
+            serialize_pending_execution(pending),
+            pending.created_at,
+        )
+        preview_names = "\n".join(f"- {name}" for name in pending.server_names[:10])
+        more = "" if len(pending.server_names) <= 10 else f"\n... 还有 {len(pending.server_names) - 10} 台"
+        match_text = (
+            f"匹配依据：{pending.match_summary}\n"
+            if pending.match_summary
+            else ""
+        )
+        text = (
+            "即将批量执行命令，请确认：\n\n"
+            f"面板：{pending.dashboard_alias}\n"
+            f"目标：{pending.source}\n"
+            f"{match_text}"
+            f"数量：{len(pending.server_ids)} 台\n"
+            f"服务器：\n{preview_names}{more}\n\n"
+            f"命令：\n{pending.command}\n\n"
+            "风险提示：该命令会在目标服务器上执行。确认前请检查目标和命令。"
+        )
+        keyboard = [
+            [InlineKeyboardButton("确认执行", callback_data=f"exec_confirm_{execution_id}")],
+            [InlineKeyboardButton("取消", callback_data=f"exec_cancel_{execution_id}")],
+        ]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    await update.message.reply_text(result.get("text") or "没有可展示的回复。")
 
 
 async def edit_message_with_auto_delete(query: CallbackQuery, text: str, **kwargs):
@@ -1201,6 +1649,10 @@ def main():
     application.add_handler(CommandHandler("cron", cron_jobs))
     application.add_handler(CommandHandler("services", services_overview))
     application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("servers", servers_entry))
+    application.add_handler(CommandHandler("mcp", mcp_shortcut))
+    application.add_handler(CommandHandler("chat", chat_command))
+    application.add_handler(CommandHandler("llm", chat_command))
 
     # 绑定命令的会话处理
     bind_handler = ConversationHandler(
@@ -1232,6 +1684,11 @@ def main():
         fallbacks=[],
     )
     application.add_handler(server_handler)
+
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, settings_text_handler),
+        group=1,
+    )
 
     # 在 run_polling 中指定 allowed_updates
     application.run_polling(allowed_updates=["message", "callback_query"])
