@@ -25,6 +25,7 @@ class PendingExecution:
     server_ids: list
     server_names: list
     source: str
+    match_summary: str = ""
     created_at: int = 0
 
     def __post_init__(self):
@@ -134,14 +135,29 @@ class AssistantRuntime:
     async def get_server_detail(self, server_id):
         return await self.api.get_server_detail(int(server_id))
 
-    async def prepare_batch_command(self, command, query=None, group_name=None, status="online"):
+    async def prepare_batch_command(
+        self,
+        command,
+        query=None,
+        group_name=None,
+        status="online",
+        server_ids=None,
+        server_names=None,
+    ):
         if not command or not str(command).strip():
             return {"error": "命令为空，无法准备执行。"}
         if not self.dashboard.get("api_token"):
             return {"error": "MCP 命令执行需要 API Token，请先在面板设置中绑定 nzp_ Token。"}
-        result = await self.search_servers(
-            query=query, group_name=group_name, status=status or "online"
-        )
+        if server_ids or server_names:
+            result = await self.resolve_server_targets(
+                server_ids=server_ids, server_names=server_names
+            )
+            if result.get("error"):
+                return result
+        else:
+            result = await self.search_servers(
+                query=query, group_name=group_name, status=status or "online"
+            )
         servers = result.get("servers") or []
         if not servers:
             return {"error": "没有找到匹配的服务器。"}
@@ -153,6 +169,7 @@ class AssistantRuntime:
             server_ids=[int(s["id"]) for s in servers],
             server_names=[str(s["name"]) for s in servers],
             source=result.get("source") or query or group_name or "selected",
+            match_summary=result.get("match_summary") or "",
         )
         self.pending_execution = pending
         return {
@@ -162,6 +179,57 @@ class AssistantRuntime:
             "server_names": pending.server_names[:20],
             "command": pending.command,
             "source": pending.source,
+            "match_summary": pending.match_summary,
+        }
+
+    async def resolve_server_targets(self, server_ids=None, server_names=None):
+        servers = await self._servers_with_groups()
+        by_id = {int(s.get("id")): s for s in servers if s.get("id") is not None}
+        selected = {}
+        summaries = []
+
+        for raw_id in server_ids or []:
+            try:
+                server_id = int(raw_id)
+            except (TypeError, ValueError):
+                return {"error": f"服务器 ID 无效：{raw_id}"}
+            server = by_id.get(server_id)
+            if not server:
+                return {"error": f"没有找到服务器 ID：{server_id}"}
+            selected[server_id] = server
+            summaries.append(f"ID {server_id} -> {server.get('name')}")
+
+        for raw_name in server_names or []:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            exact = [
+                s for s in servers if str(s.get("name", "")).lower() == name.lower()
+            ]
+            matches = exact or [
+                s for s in servers if name.lower() in str(s.get("name", "")).lower()
+            ]
+            if not matches:
+                return {"error": f"没有找到服务器名称：{name}"}
+            if len(matches) > 1:
+                names = ", ".join(str(s.get("name")) for s in matches[:8])
+                more = "" if len(matches) <= 8 else f" 等 {len(matches)} 台"
+                return {
+                    "error": f"目标不唯一：{name} 匹配 {names}{more}。请使用服务器 ID 或完整名称。"
+                }
+            server = matches[0]
+            server_id = int(server["id"])
+            selected[server_id] = server
+            summaries.append(f"{name} -> {server.get('name')} (ID {server_id})")
+
+        return {
+            "servers": [
+                {"id": s.get("id"), "name": s.get("name"), "online": bool(s.get("_online"))}
+                for s in selected.values()
+            ],
+            "count": len(selected),
+            "source": "explicit-targets",
+            "match_summary": "\n".join(summaries),
         }
 
     async def _servers_with_groups(self):
@@ -222,13 +290,21 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "prepare_batch_command",
-            "description": "Prepare a batch command execution preview. This never executes; Telegram confirmation is required.",
+            "description": "Prepare a batch command execution preview. This never executes; Telegram confirmation is required. Prefer explicit server_ids or exact server_names when the user names specific servers.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "query": {"type": "string"},
                     "group_name": {"type": "string"},
+                    "server_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                    "server_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "status": {"type": "string", "enum": ["all", "online", "offline"]},
                 },
                 "required": ["command"],
@@ -258,6 +334,9 @@ async def run_assistant_message(database, telegram_id, dashboard, api, llm_confi
             "role": "system",
             "content": (
                 "你是 Nezha Telegram Bot 的运维助手。你可以查询服务器和分组。"
+                "用户提到具体服务器 ID 或完整服务器名时，先用实时服务器列表确认目标，"
+                "再把明确的 server_ids 或 server_names 传给 prepare_batch_command。"
+                "不要把不明确的简称扩大成所有服务器。"
                 "任何执行命令都只能调用 prepare_batch_command 准备预览，绝不能直接执行。"
                 "优先用中文简洁回答。"
             ),
@@ -318,6 +397,7 @@ async def heuristic_batch_plan(runtime, text):
     elif "apk" in text:
         command = text[text.find("apk") :].strip()
     group_name = None
+    server_ids = [int(item) for item in re.findall(r"(?:id|ID)\s*[:：#]?\s*(\d+)", text)]
     group_match = re.search(
         r"([A-Za-z0-9_\-\u4e00-\u9fff]+)\s*(?:分组|group)", text, re.I
     )
@@ -328,6 +408,8 @@ async def heuristic_batch_plan(runtime, text):
     if group_match:
         group_name = group_match.group(1)
     if command:
-        result = await runtime.prepare_batch_command(command, group_name=group_name, status="online")
+        result = await runtime.prepare_batch_command(
+            command, group_name=group_name, server_ids=server_ids, status="online"
+        )
         return runtime.pending_execution or result
     return None

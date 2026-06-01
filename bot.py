@@ -1590,10 +1590,16 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         preview_names = "\n".join(f"- {name}" for name in pending.server_names[:10])
         more = "" if len(pending.server_names) <= 10 else f"\n... 还有 {len(pending.server_names) - 10} 台"
+        match_text = (
+            f"匹配依据：{pending.match_summary}\n"
+            if pending.match_summary
+            else ""
+        )
         text = (
             "即将批量执行命令，请确认：\n\n"
             f"面板：{pending.dashboard_alias}\n"
             f"目标：{pending.source}\n"
+            f"{match_text}"
             f"数量：{len(pending.server_ids)} 台\n"
             f"服务器：\n{preview_names}{more}\n\n"
             f"命令：\n{pending.command}\n\n"

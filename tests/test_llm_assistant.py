@@ -60,13 +60,16 @@ class LLMAssistantTests(unittest.TestCase):
         class Runtime:
             pending_execution = None
 
-            async def prepare_batch_command(self, command, query=None, group_name=None, status="online"):
+            async def prepare_batch_command(
+                self, command, query=None, group_name=None, status="online", **kwargs
+            ):
                 calls.append(
                     {
                         "command": command,
                         "query": query,
                         "group_name": group_name,
                         "status": status,
+                        **kwargs,
                     }
                 )
                 return {"requires_confirmation": True}
@@ -76,6 +79,64 @@ class LLMAssistantTests(unittest.TestCase):
         self.assertEqual(calls[0]["command"], "apt-get update")
         self.assertEqual(calls[0]["group_name"], "hk")
         self.assertEqual(calls[0]["status"], "online")
+
+    def test_prepare_batch_command_targets_exact_server_ids(self):
+        class API:
+            async def get_servers(self):
+                return {
+                    "success": True,
+                    "data": [
+                        {"id": 11, "name": "hk-web-1", "last_active": "2026-06-01T08:00:00Z"},
+                        {"id": 12, "name": "hk-db-1", "last_active": "2026-06-01T08:00:00Z"},
+                    ],
+                }
+
+            async def get_server_groups(self):
+                return {"success": True, "data": []}
+
+        runtime = AssistantRuntime(
+            database=None,
+            telegram_id=42,
+            dashboard={"id": 7, "alias": "MAIN", "api_token": "nzp_secret"},
+            api=API(),
+        )
+
+        result = asyncio.run(
+            runtime.prepare_batch_command("uptime", server_ids=[12], status="all")
+        )
+
+        self.assertTrue(result["requires_confirmation"])
+        self.assertEqual(runtime.pending_execution.server_ids, [12])
+        self.assertEqual(runtime.pending_execution.server_names, ["hk-db-1"])
+        self.assertEqual(runtime.pending_execution.match_summary, "ID 12 -> hk-db-1")
+
+    def test_prepare_batch_command_rejects_ambiguous_server_name(self):
+        class API:
+            async def get_servers(self):
+                return {
+                    "success": True,
+                    "data": [
+                        {"id": 11, "name": "hk-web-1", "last_active": "2026-06-01T08:00:00Z"},
+                        {"id": 12, "name": "hk-web-2", "last_active": "2026-06-01T08:00:00Z"},
+                    ],
+                }
+
+            async def get_server_groups(self):
+                return {"success": True, "data": []}
+
+        runtime = AssistantRuntime(
+            database=None,
+            telegram_id=42,
+            dashboard={"id": 7, "alias": "MAIN", "api_token": "nzp_secret"},
+            api=API(),
+        )
+
+        result = asyncio.run(
+            runtime.prepare_batch_command("uptime", server_names=["hk-web"], status="all")
+        )
+
+        self.assertIn("目标不唯一", result["error"])
+        self.assertIsNone(runtime.pending_execution)
 
 
 if __name__ == "__main__":
