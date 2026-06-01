@@ -23,7 +23,7 @@ from telegram.ext import (
 from nezha_api import NezhaAPI
 from database import Database
 from llm_assistant import (
-    deserialize_pending_execution,
+    load_pending_execution_for_confirmation,
     redact_secret,
     run_assistant_message,
     serialize_pending_execution,
@@ -758,6 +758,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("exec_cancel_"):
         await query.answer()
         execution_id = data.split("exec_cancel_", 1)[1]
+        row = await db.get_pending_execution(execution_id)
+        if not row or row["telegram_id"] != query.from_user.id:
+            await edit_message_with_auto_delete(query, "确认已过期或无权限。")
+            return
         await db.delete_pending_execution(execution_id)
         await edit_message_with_auto_delete(query, "操作已取消。")
         return
@@ -768,11 +772,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.answer()
         execution_id = data.split("exec_confirm_", 1)[1]
-        row = await db.get_pending_execution(execution_id)
-        if not row or row["telegram_id"] != query.from_user.id:
-            await edit_message_with_auto_delete(query, "确认已过期或无权限。")
+        loaded = await load_pending_execution_for_confirmation(
+            db, execution_id, query.from_user.id
+        )
+        if loaded.get("error"):
+            await edit_message_with_auto_delete(query, loaded["error"])
             return
-        pending = deserialize_pending_execution(row["payload"])
+        pending = loaded["pending"]
         dashboard_row = await db.get_dashboard(query.from_user.id, pending.dashboard_id)
         if not dashboard_row:
             await edit_message_with_auto_delete(query, "未找到面板绑定。")
@@ -1563,14 +1569,32 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先使用 /bind 命令绑定您的账号。")
         return
     user_text = " ".join(context.args).strip()
+    message_thread_id = getattr(update.effective_message, "message_thread_id", None) or 0
+    chat_id = update.effective_chat.id
+    if user_text.lower() in {"reset", "重置", "清空", "clear"}:
+        await db.reset_llm_session(
+            update.effective_user.id, chat_id, message_thread_id, dashboard_row["id"]
+        )
+        await update.message.reply_text("已清空当前面板的 LLM 对话记忆和待确认命令。")
+        return
     if not user_text:
-        await update.message.reply_text("请在 /chat 后面写你的请求，例如：/chat 在 hk 分组执行 `apt-get update`")
+        await update.message.reply_text(
+            "请在 /chat 后面写你的请求，例如：/chat 在 hk 分组执行 `apt-get update`\n"
+            "清空记忆：/chat reset"
+        )
         return
     llm_config = await db.get_llm_config(update.effective_user.id, dashboard_row["id"])
     api = create_api(dashboard_row)
     try:
         result = await run_assistant_message(
-            db, update.effective_user.id, dashboard_row, api, llm_config, user_text
+            db,
+            update.effective_user.id,
+            dashboard_row,
+            api,
+            llm_config,
+            user_text,
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
         )
     except Exception as e:
         await update.message.reply_text(f"助手处理失败：{e}")

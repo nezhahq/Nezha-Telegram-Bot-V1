@@ -3,7 +3,26 @@ import re
 import time
 from dataclasses import asdict, dataclass
 
-from server_utils import attach_group_ids, filter_servers, sort_servers_for_display
+from server_utils import (
+    attach_group_ids,
+    filter_servers,
+    server_is_online,
+    sort_servers_for_display,
+)
+
+
+HISTORY_LIMIT = 12
+
+SYSTEM_PROMPT = (
+    "你是 Nezha Telegram Bot 的运维助手。你可以查询服务器和分组。"
+    "不要推断服务器在线状态；必须使用 search_servers 返回的 explicit status、online、"
+    "online_count、offline_count 字段说明在线/离线。如果字段缺失或不一致，就说未知，"
+    "不要把未知说成离线。用户提到具体服务器 ID 或完整服务器名时，先用实时服务器列表确认目标，"
+    "再把明确的 server_ids 或 server_names 传给 prepare_batch_command。"
+    "不要把不明确的简称扩大成所有服务器。任何执行命令都只能调用 prepare_batch_command 准备预览，"
+    "绝不能直接执行。准备命令前要总结目标依据，确认目标来自哪个面板、哪些 ID/名称或哪个分组，"
+    "然后交给 Telegram 二次确认。优先用中文简洁回答。"
+)
 
 
 def redact_secret(value):
@@ -40,6 +59,45 @@ def serialize_pending_execution(pending):
 def deserialize_pending_execution(payload):
     data = json.loads(payload)
     return PendingExecution(**data)
+
+
+def normalize_server_summary(server):
+    online = server_is_online(server)
+    return {
+        "id": server.get("id"),
+        "name": server.get("name"),
+        "online": online,
+        "status": "online" if online else "offline",
+        "last_active": server.get("last_active"),
+    }
+
+
+def bounded_history(messages, limit=HISTORY_LIMIT):
+    cleaned = []
+    for message in messages or []:
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content.strip()[:4000]})
+    return cleaned[-limit:]
+
+
+async def load_pending_execution_for_confirmation(
+    database, execution_id, telegram_id, dashboard_id=None
+):
+    row = await database.get_pending_execution(execution_id)
+    if not row:
+        return {"error": "确认已过期或不存在。"}
+    if row["telegram_id"] != telegram_id:
+        return {"error": "确认已过期或无权限。"}
+    pending = deserialize_pending_execution(row["payload"])
+    if pending.owner_telegram_id != telegram_id:
+        return {"error": "确认已过期或无权限。"}
+    if row["dashboard_id"] != pending.dashboard_id:
+        return {"error": "确认记录面板不一致，已拒绝执行。"}
+    if dashboard_id is not None and int(dashboard_id) != int(pending.dashboard_id):
+        return {"error": "确认面板不匹配，已拒绝执行。"}
+    return {"row": row, "pending": pending}
 
 
 class OpenAICompatibleClient:
@@ -123,13 +181,14 @@ class AssistantRuntime:
             high_load=high_load,
             high_traffic=high_traffic,
         )
+        normalized = [normalize_server_summary(s) for s in result]
         return {
-            "servers": [
-                {"id": s.get("id"), "name": s.get("name"), "online": bool(s.get("_online"))}
-                for s in result
-            ],
+            "servers": normalized,
             "count": len(result),
+            "online_count": sum(1 for s in normalized if s["online"]),
+            "offline_count": sum(1 for s in normalized if not s["online"]),
             "source": source,
+            "status_basis": "last_active within threshold",
         }
 
     async def get_server_detail(self, server_id):
@@ -223,10 +282,7 @@ class AssistantRuntime:
             summaries.append(f"{name} -> {server.get('name')} (ID {server_id})")
 
         return {
-            "servers": [
-                {"id": s.get("id"), "name": s.get("name"), "online": bool(s.get("_online"))}
-                for s in selected.values()
-            ],
+            "servers": [normalize_server_summary(s) for s in selected.values()],
             "count": len(selected),
             "source": "explicit-targets",
             "match_summary": "\n".join(summaries),
@@ -261,7 +317,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_servers",
-            "description": "Search/filter servers by name, group name, status, high load, or high traffic.",
+            "description": (
+                "Search/filter servers and return explicit server status. Use online, status, "
+                "online_count, and offline_count exactly; do not infer status from missing fields."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -314,8 +373,19 @@ TOOLS = [
 ]
 
 
-async def run_assistant_message(database, telegram_id, dashboard, api, llm_config, user_text):
+async def run_assistant_message(
+    database,
+    telegram_id,
+    dashboard,
+    api,
+    llm_config,
+    user_text,
+    chat_id=None,
+    message_thread_id=0,
+):
     runtime = AssistantRuntime(database, telegram_id, dashboard, api)
+    chat_id = int(chat_id if chat_id is not None else telegram_id)
+    message_thread_id = int(message_thread_id or 0)
     if not llm_config or not llm_config.get("api_key"):
         result = await heuristic_batch_plan(runtime, user_text)
         if isinstance(result, PendingExecution):
@@ -329,25 +399,28 @@ async def run_assistant_message(database, telegram_id, dashboard, api, llm_confi
         llm_config.get("api_key"),
         llm_config.get("model") or "gpt-4o-mini",
     )
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是 Nezha Telegram Bot 的运维助手。你可以查询服务器和分组。"
-                "用户提到具体服务器 ID 或完整服务器名时，先用实时服务器列表确认目标，"
-                "再把明确的 server_ids 或 server_names 传给 prepare_batch_command。"
-                "不要把不明确的简称扩大成所有服务器。"
-                "任何执行命令都只能调用 prepare_batch_command 准备预览，绝不能直接执行。"
-                "优先用中文简洁回答。"
-            ),
-        },
-        {"role": "user", "content": user_text},
-    ]
+    history = bounded_history(
+        await database.get_llm_history(
+            telegram_id, chat_id, message_thread_id, dashboard["id"]
+        )
+    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    messages.append({"role": "user", "content": user_text})
     for _ in range(5):
         message = await client.chat(messages, TOOLS)
         calls = message.get("tool_calls") or []
         if not calls:
-            return {"text": message.get("content") or "没有可展示的回复。"}
+            text = message.get("content") or "没有可展示的回复。"
+            await database.save_llm_history(
+                telegram_id,
+                chat_id,
+                message_thread_id,
+                dashboard["id"],
+                bounded_history(
+                    [*history, {"role": "user", "content": user_text}, {"role": "assistant", "content": text}]
+                ),
+            )
+            return {"text": text}
         messages.append(message)
         for call in calls:
             name = call.get("function", {}).get("name")
@@ -363,6 +436,25 @@ async def run_assistant_message(database, telegram_id, dashboard, api, llm_confi
                 }
             )
             if runtime.pending_execution:
+                await database.save_llm_history(
+                    telegram_id,
+                    chat_id,
+                    message_thread_id,
+                    dashboard["id"],
+                    bounded_history(
+                        [
+                            *history,
+                            {"role": "user", "content": user_text},
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    f"已准备在 {runtime.pending_execution.dashboard_alias} "
+                                    f"执行 {runtime.pending_execution.command}，等待确认。"
+                                ),
+                            },
+                        ]
+                    ),
+                )
                 return {"pending_execution": runtime.pending_execution}
     return {"text": "助手工具调用次数过多，请缩小目标范围后再试。"}
 

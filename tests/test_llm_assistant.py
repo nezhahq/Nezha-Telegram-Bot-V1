@@ -3,11 +3,14 @@ import asyncio
 
 from llm_assistant import (
     AssistantRuntime,
+    SYSTEM_PROMPT,
     PendingExecution,
     deserialize_pending_execution,
     heuristic_batch_plan,
+    load_pending_execution_for_confirmation,
     redact_secret,
     serialize_pending_execution,
+    TOOLS,
 )
 
 
@@ -137,6 +140,81 @@ class LLMAssistantTests(unittest.TestCase):
 
         self.assertIn("目标不唯一", result["error"])
         self.assertIsNone(runtime.pending_execution)
+
+    def test_search_servers_reports_online_from_last_active(self):
+        from datetime import datetime, timedelta, timezone
+
+        class API:
+            async def get_servers(self):
+                return {
+                    "success": True,
+                    "data": [
+                        {
+                            "id": 11,
+                            "name": "hk-web-1",
+                            "last_active": (
+                                datetime.now(timezone.utc) - timedelta(seconds=2)
+                            ).isoformat(),
+                        }
+                    ],
+                }
+
+            async def get_server_groups(self):
+                return {"success": True, "data": []}
+
+        runtime = AssistantRuntime(
+            database=None,
+            telegram_id=42,
+            dashboard={"id": 7, "alias": "MAIN", "api_token": "nzp_secret"},
+            api=API(),
+        )
+
+        result = asyncio.run(runtime.search_servers(status="all"))
+
+        self.assertEqual(result["online_count"], 1)
+        self.assertEqual(result["offline_count"], 0)
+        self.assertIs(result["servers"][0]["online"], True)
+        self.assertEqual(result["servers"][0]["status"], "online")
+
+    def test_system_prompt_and_tool_schema_constrain_status_accuracy(self):
+        tool_text = str(TOOLS)
+
+        self.assertIn("不要推断服务器在线状态", SYSTEM_PROMPT)
+        self.assertIn("online_count", tool_text)
+        self.assertIn("offline_count", tool_text)
+
+    def test_pending_confirmation_rejects_wrong_user_or_dashboard(self):
+        pending = PendingExecution(
+            owner_telegram_id=42,
+            dashboard_id=7,
+            dashboard_alias="MAIN",
+            command="uptime",
+            server_ids=[11],
+            server_names=["hk-web-1"],
+            source="explicit-targets",
+        )
+
+        class DB:
+            async def get_pending_execution(self, execution_id):
+                return {
+                    "id": execution_id,
+                    "telegram_id": 42,
+                    "dashboard_id": 7,
+                    "payload": serialize_pending_execution(pending),
+                    "created_at": pending.created_at,
+                }
+
+        ok = asyncio.run(load_pending_execution_for_confirmation(DB(), "abc", 42, 7))
+        wrong_user = asyncio.run(
+            load_pending_execution_for_confirmation(DB(), "abc", 99, 7)
+        )
+        wrong_dashboard = asyncio.run(
+            load_pending_execution_for_confirmation(DB(), "abc", 42, 8)
+        )
+
+        self.assertIsInstance(ok["pending"], PendingExecution)
+        self.assertIn("无权限", wrong_user["error"])
+        self.assertIn("面板", wrong_dashboard["error"])
 
 
 if __name__ == "__main__":

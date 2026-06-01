@@ -97,6 +97,77 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(dashboard["username"], "alice")
             self.assertEqual(dashboard["api_token"], "nzp_parallel_secret")
 
+    def test_llm_history_is_isolated_by_user_chat_thread_and_dashboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "users.db")
+            database = Database(db_path)
+            asyncio.run(database.initialize())
+
+            asyncio.run(
+                database.save_llm_history(
+                    42,
+                    1001,
+                    0,
+                    7,
+                    [{"role": "user", "content": "dashboard 7"}],
+                )
+            )
+            asyncio.run(
+                database.save_llm_history(
+                    42,
+                    1001,
+                    0,
+                    8,
+                    [{"role": "user", "content": "dashboard 8"}],
+                )
+            )
+            asyncio.run(
+                database.save_llm_history(
+                    43,
+                    1001,
+                    0,
+                    7,
+                    [{"role": "user", "content": "other user"}],
+                )
+            )
+
+            self.assertEqual(
+                asyncio.run(database.get_llm_history(42, 1001, 0, 7))[0]["content"],
+                "dashboard 7",
+            )
+            self.assertEqual(
+                asyncio.run(database.get_llm_history(42, 1001, 0, 8))[0]["content"],
+                "dashboard 8",
+            )
+            self.assertEqual(
+                asyncio.run(database.get_llm_history(43, 1001, 0, 7))[0]["content"],
+                "other user",
+            )
+
+    def test_reset_llm_session_clears_history_and_pending_for_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "users.db")
+            database = Database(db_path)
+            asyncio.run(database.initialize())
+
+            asyncio.run(
+                database.save_llm_history(
+                    42,
+                    1001,
+                    0,
+                    7,
+                    [{"role": "user", "content": "forget me"}],
+                )
+            )
+            asyncio.run(database.save_pending_execution("same", 42, 7, "{}", 1))
+            asyncio.run(database.save_pending_execution("other", 42, 8, "{}", 1))
+
+            asyncio.run(database.reset_llm_session(42, 1001, 0, 7))
+
+            self.assertEqual(asyncio.run(database.get_llm_history(42, 1001, 0, 7)), [])
+            self.assertIsNone(asyncio.run(database.get_pending_execution("same")))
+            self.assertIsNotNone(asyncio.run(database.get_pending_execution("other")))
+
 
 if __name__ == "__main__":
     unittest.main()
