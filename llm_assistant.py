@@ -294,21 +294,58 @@ class OpenAICompatibleClient:
     def parse_responses_message(self, data):
         output = data.get("output") or []
         tool_calls = []
-        text_parts = []
-        if isinstance(data.get("output_text"), str):
-            text_parts.append(data.get("output_text"))
+        text_parts = self.extract_responses_text_parts(data)
         for item in output:
             if item.get("type") == "function_call":
                 tool_calls.append(self.normalize_responses_tool_call(item))
-            elif item.get("type") == "message":
-                for content in item.get("content") or []:
-                    if content.get("type") in {"output_text", "text"}:
-                        text_parts.append(content.get("text") or "")
         return {
             "role": "assistant",
             "content": "\n".join(part for part in text_parts if part),
             "tool_calls": tool_calls,
         }
+
+    def extract_responses_text_parts(self, value):
+        if not isinstance(value, dict):
+            return []
+        text_parts = []
+        output_text = value.get("output_text")
+        if isinstance(output_text, str) and output_text:
+            text_parts.append(output_text)
+        output = value.get("output")
+        if isinstance(output, list):
+            for item in output:
+                text_parts.extend(self.extract_responses_text_parts(item))
+        content = value.get("content")
+        if isinstance(content, list):
+            for part in content:
+                text_parts.extend(self.extract_responses_text_parts(part))
+        elif isinstance(content, str) and content:
+            text_parts.append(content)
+        if value.get("type") in {"output_text", "text", "input_text"}:
+            text = value.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        text = value.get("text")
+        if not text_parts and isinstance(text, str) and text:
+            text_parts.append(text)
+        return text_parts
+
+    def extract_responses_stream_text_parts(self, event):
+        text_parts = []
+        for key in ("delta", "text", "output_text"):
+            value = event.get(key)
+            if isinstance(value, str) and value:
+                text_parts.append(value)
+            elif isinstance(value, dict):
+                text_parts.extend(self.extract_responses_text_parts(value))
+        for key in ("part", "content_part", "item", "message", "response"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                text_parts.extend(self.extract_responses_text_parts(value))
+        output = event.get("output")
+        if isinstance(output, list):
+            text_parts.extend(self.extract_responses_text_parts({"output": output}))
+        return text_parts
 
     def normalize_responses_tool_call(self, item):
         return {
@@ -360,24 +397,28 @@ class OpenAICompatibleClient:
         tool_calls = []
         text_parts = []
         final_message = None
+        seen_event_types = []
         for event in events:
             event_type = event.get("type")
+            if event_type:
+                seen_event_types.append(event_type)
             if event_type == "response.output_text.delta":
-                text_parts.append(event.get("delta") or "")
+                text_parts.extend(self.extract_responses_stream_text_parts(event))
                 continue
             if event_type == "response.output_text.done":
-                done_text = event.get("text")
+                done_text = self.extract_responses_stream_text_parts(event)
                 if done_text:
-                    text_parts = [done_text]
+                    text_parts = done_text
+                continue
+            if event_type == "response.content_part.added":
+                text_parts.extend(self.extract_responses_stream_text_parts(event))
                 continue
             if event_type == "response.output_item.done":
                 item = event.get("item") or {}
                 if item.get("type") == "function_call":
                     tool_calls.append(self.normalize_responses_tool_call(item))
-                elif item.get("type") == "message":
-                    for content in item.get("content") or []:
-                        if content.get("type") in {"output_text", "text"}:
-                            text_parts.append(content.get("text") or "")
+                else:
+                    text_parts.extend(self.extract_responses_text_parts(item))
                 continue
             if event_type == "response.completed":
                 response = event.get("response") or {}
@@ -388,12 +429,19 @@ class OpenAICompatibleClient:
                 message = error.get("message") if isinstance(error, dict) else None
                 raise RuntimeError(message or "LLM Responses streaming failed")
         if final_message:
+            final_tool_calls = final_message.get("tool_calls") or []
+            final_call_ids = {call.get("id") for call in final_tool_calls}
+            for call in tool_calls:
+                if call.get("id") not in final_call_ids:
+                    final_tool_calls.append(call)
+            final_message["tool_calls"] = final_tool_calls
             if final_message.get("content") or final_message.get("tool_calls"):
                 return final_message
         return {
             "role": "assistant",
             "content": "".join(part for part in text_parts if part),
             "tool_calls": tool_calls,
+            "debug": f"events={','.join(seen_event_types[-8:])}" if seen_event_types else "events=none",
         }
 
 
@@ -679,9 +727,11 @@ async def run_assistant_message(
         if not calls:
             text = message.get("content")
             if not text:
+                debug = message.get("debug")
+                debug_suffix = f", {debug}" if debug else ""
                 text = (
                     "没有可展示的回复。"
-                    f" endpoint={client.api_mode}, tool_calls={len(calls)}"
+                    f" endpoint={client.api_mode}, tool_calls={len(calls)}{debug_suffix}"
                 )
             await database.save_llm_history(
                 telegram_id,

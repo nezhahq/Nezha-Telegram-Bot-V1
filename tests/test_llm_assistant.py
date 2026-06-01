@@ -310,6 +310,107 @@ class LLMAssistantTests(unittest.TestCase):
         self.assertEqual(message["tool_calls"][0]["function"]["name"], "search_servers")
         self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"query":"hk"}')
 
+    def test_responses_stream_extracts_text_from_codex_event_shapes(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
+        )
+        cases = [
+            (
+                "output_text_done",
+                [
+                    {"type": "response.output_text.delta", "delta": "状"},
+                    {"type": "response.output_text.delta", "delta": "态"},
+                    {"type": "response.output_text.done", "text": "状态正常"},
+                ],
+                "状态正常",
+            ),
+            (
+                "content_part_added_part",
+                [
+                    {
+                        "type": "response.content_part.added",
+                        "part": {"type": "output_text", "text": "状态正常"},
+                    },
+                ],
+                "状态正常",
+            ),
+            (
+                "content_part_added_text_payload",
+                [
+                    {
+                        "type": "response.content_part.added",
+                        "content_part": {"type": "text", "text": "状态正常"},
+                    },
+                ],
+                "状态正常",
+            ),
+            (
+                "output_item_done_message",
+                [
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "状态正常"}],
+                        },
+                    },
+                ],
+                "状态正常",
+            ),
+            (
+                "completed_nested_output_text",
+                [
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "状态正常"}],
+                                }
+                            ]
+                        },
+                    },
+                ],
+                "状态正常",
+            ),
+            (
+                "completed_top_level_output_text",
+                [
+                    {
+                        "type": "response.completed",
+                        "response": {"output_text": "状态正常"},
+                    },
+                ],
+                "状态正常",
+            ),
+        ]
+
+        for name, events, expected in cases:
+            with self.subTest(name=name):
+                message = client.parse_responses_stream_events(events)
+                self.assertEqual(message["content"], expected)
+                self.assertEqual(message["tool_calls"], [])
+
+    def test_responses_stream_extracts_final_response_text_from_sse_payloads(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
+        )
+
+        class Response:
+            content = [
+                b": keepalive\n\n",
+                b"\n",
+                'data: {"type":"response.content_part.added","part":{"type":"output_text","text":"临时"}}\n\n',
+                'data: {"type":"response.completed","response":{"output_text":"最终状态正常"}}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+
+        message = asyncio.run(client.parse_responses_stream(Response()))
+
+        self.assertEqual(message["content"], "最终状态正常")
+        self.assertEqual(message["tool_calls"], [])
+
     def test_responses_stream_ignores_sse_noise_and_done_marker(self):
         client = OpenAICompatibleClient(
             "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
