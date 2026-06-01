@@ -310,6 +310,133 @@ class LLMAssistantTests(unittest.TestCase):
         self.assertEqual(message["tool_calls"][0]["function"]["name"], "search_servers")
         self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"query":"hk"}')
 
+    def test_responses_stream_ignores_sse_noise_and_done_marker(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
+        )
+
+        class Response:
+            content = [
+                b"\n",
+                b": keepalive\n",
+                b"event: response.output_text.delta\n",
+                'data: {"type":"response.output_text.delta","delta":"状"}\n',
+                b"\n",
+                b"event: response.output_text.done\n",
+                'data: {"type":"response.output_text.done","text":"状态正常"}\n',
+                b"\n",
+                b"event: response.completed\n",
+                'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"最终状态正常"}]}]}}\n',
+                b"\n",
+                b"data: [DONE]\n",
+            ]
+
+        message = asyncio.run(client.parse_responses_stream(Response()))
+
+        self.assertEqual(message["content"], "最终状态正常")
+        self.assertEqual(message["tool_calls"], [])
+
+    def test_auto_falls_back_to_responses_on_empty_chat_json(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="auto"
+        )
+        posts = []
+
+        class Response:
+            def __init__(self, status, payload=None, json_error=None):
+                self.status = status
+                self.payload = payload
+                self.json_error = json_error
+                self.content = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                if self.json_error:
+                    raise self.json_error
+                return self.payload
+
+        class Session:
+            def post(self, url, json, headers):
+                posts.append(url)
+                if url.endswith("/chat/completions"):
+                    return Response(
+                        404,
+                        json_error=__import__("json").JSONDecodeError(
+                            "Expecting value", "", 0
+                        ),
+                    )
+                return Response(
+                    200,
+                    {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "ok"}],
+                            }
+                        ]
+                    },
+                )
+
+        message = asyncio.run(
+            client.chat_with_session(
+                Session(),
+                {"Authorization": "Bearer sk-test"},
+                [{"role": "user", "content": "hi"}],
+                TOOLS,
+            )
+        )
+
+        self.assertEqual(posts[0], "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(posts[1], "https://api.openai.com/v1/responses")
+        self.assertEqual(message["content"], "ok")
+
+    def test_auto_prefers_responses_for_codex_like_backend(self):
+        client = OpenAICompatibleClient(
+            "https://codex-channel.example/v1", "sk-test", "codex-mini", api_mode="auto"
+        )
+        posts = []
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "ok"}],
+                        }
+                    ]
+                }
+
+        class Session:
+            def post(self, url, json, headers):
+                posts.append(url)
+                return Response()
+
+        message = asyncio.run(
+            client.chat_with_session(
+                Session(),
+                {"Authorization": "Bearer sk-test"},
+                [{"role": "user", "content": "hi"}],
+                TOOLS,
+            )
+        )
+
+        self.assertEqual(posts, ["https://codex-channel.example/v1/responses"])
+        self.assertEqual(message["content"], "ok")
+
     def test_responses_retries_with_stream_when_required(self):
         client = OpenAICompatibleClient(
             "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="auto"

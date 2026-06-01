@@ -123,20 +123,30 @@ class OpenAICompatibleClient:
         headers = {"Authorization": f"Bearer {self.api_key}"}
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            if self.api_mode in {"responses", "responses_stream"}:
-                return await self.post_responses(
-                    session,
-                    headers,
-                    messages,
-                    tools,
-                    stream=self.api_mode == "responses_stream",
-                )
-            try:
-                return await self.post_chat_completions(session, headers, messages, tools)
-            except RuntimeError as exc:
-                if self.api_mode == "chat" or not self.should_retry_with_responses(exc):
-                    raise
-                return await self.post_responses(session, headers, messages, tools)
+            return await self.chat_with_session(session, headers, messages, tools)
+
+    async def chat_with_session(self, session, headers, messages, tools):
+        if self.api_mode in {"responses", "responses_stream"}:
+            return await self.post_responses(
+                session,
+                headers,
+                messages,
+                tools,
+                stream=self.api_mode == "responses_stream",
+            )
+        if self.api_mode == "auto" and self.prefers_responses_endpoint():
+            return await self.post_responses(session, headers, messages, tools)
+        try:
+            return await self.post_chat_completions(session, headers, messages, tools)
+        except RuntimeError as exc:
+            if self.api_mode == "chat" or not self.should_retry_with_responses(exc):
+                raise
+            return await self.post_responses(session, headers, messages, tools)
+
+    def prefers_responses_endpoint(self):
+        text = f"{self.base_url} {self.model}".lower()
+        compact = re.sub(r"[\s_\-]+", " ", text)
+        return "codex" in compact or "codex channel" in compact
 
     async def post_chat_completions(self, session, headers, messages, tools):
         payload = {
@@ -149,7 +159,13 @@ class OpenAICompatibleClient:
         async with session.post(
             f"{self.base_url}/chat/completions", json=payload, headers=headers
         ) as resp:
-            data = await resp.json(content_type=None)
+            data = await self.read_json_response(resp)
+            if data is None:
+                detail = await self.read_response_text(resp)
+                message = "chat/completions returned empty or non-JSON response"
+                if detail:
+                    message = f"{message}: {detail[:200]}"
+                raise RuntimeError(message)
             if resp.status >= 400:
                 message = data.get("error", {}).get("message") if isinstance(data, dict) else None
                 raise RuntimeError(message or f"LLM 请求失败: HTTP {resp.status}")
@@ -163,7 +179,7 @@ class OpenAICompatibleClient:
         ) as resp:
             if stream and resp.status < 400:
                 return await self.parse_responses_stream(resp)
-            data = await resp.json(content_type=None)
+            data = await self.read_json_response(resp)
             if resp.status >= 400:
                 message = data.get("error", {}).get("message") if isinstance(data, dict) else None
                 if not stream and self.should_retry_with_streaming_responses(message):
@@ -171,7 +187,28 @@ class OpenAICompatibleClient:
                         session, headers, messages, tools, stream=True
                     )
                 raise RuntimeError(message or f"LLM Responses 请求失败: HTTP {resp.status}")
+            if data is None:
+                detail = await self.read_response_text(resp)
+                message = "LLM Responses returned empty or non-JSON response"
+                if detail:
+                    message = f"{message}: {detail[:200]}"
+                raise RuntimeError(message)
             return self.parse_responses_message(data)
+
+    async def read_json_response(self, resp):
+        try:
+            return await resp.json(content_type=None)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    async def read_response_text(self, resp):
+        text_reader = getattr(resp, "text", None)
+        if not text_reader:
+            return ""
+        try:
+            return await text_reader()
+        except Exception:
+            return ""
 
     def should_retry_with_responses(self, exc):
         text = str(exc).lower()
@@ -180,6 +217,10 @@ class OpenAICompatibleClient:
             or "chat completions" in text
             or "endpoint not supported" in text
             or "/v1/chat/completions" in text
+            or "non-json" in text
+            or "empty" in text
+            or "expecting value" in text
+            or "codex channel" in text
         )
 
     def should_retry_with_streaming_responses(self, message):
@@ -254,18 +295,11 @@ class OpenAICompatibleClient:
         output = data.get("output") or []
         tool_calls = []
         text_parts = []
+        if isinstance(data.get("output_text"), str):
+            text_parts.append(data.get("output_text"))
         for item in output:
             if item.get("type") == "function_call":
-                tool_calls.append(
-                    {
-                        "id": item.get("call_id") or item.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name"),
-                            "arguments": item.get("arguments") or "{}",
-                        },
-                    }
-                )
+                tool_calls.append(self.normalize_responses_tool_call(item))
             elif item.get("type") == "message":
                 for content in item.get("content") or []:
                     if content.get("type") in {"output_text", "text"}:
@@ -274,6 +308,16 @@ class OpenAICompatibleClient:
             "role": "assistant",
             "content": "\n".join(part for part in text_parts if part),
             "tool_calls": tool_calls,
+        }
+
+    def normalize_responses_tool_call(self, item):
+        return {
+            "id": item.get("call_id") or item.get("id"),
+            "type": "function",
+            "function": {
+                "name": item.get("name"),
+                "arguments": item.get("arguments") or "{}",
+            },
         }
 
     async def parse_responses_stream(self, resp):
@@ -315,28 +359,37 @@ class OpenAICompatibleClient:
     def parse_responses_stream_events(self, events):
         tool_calls = []
         text_parts = []
+        final_message = None
         for event in events:
             event_type = event.get("type")
             if event_type == "response.output_text.delta":
                 text_parts.append(event.get("delta") or "")
                 continue
+            if event_type == "response.output_text.done":
+                done_text = event.get("text")
+                if done_text:
+                    text_parts = [done_text]
+                continue
             if event_type == "response.output_item.done":
                 item = event.get("item") or {}
                 if item.get("type") == "function_call":
-                    tool_calls.append(
-                        {
-                            "id": item.get("call_id") or item.get("id"),
-                            "type": "function",
-                            "function": {
-                                "name": item.get("name"),
-                                "arguments": item.get("arguments") or "{}",
-                            },
-                        }
-                    )
+                    tool_calls.append(self.normalize_responses_tool_call(item))
                 elif item.get("type") == "message":
                     for content in item.get("content") or []:
                         if content.get("type") in {"output_text", "text"}:
                             text_parts.append(content.get("text") or "")
+                continue
+            if event_type == "response.completed":
+                response = event.get("response") or {}
+                final_message = self.parse_responses_message(response)
+                continue
+            if event_type in {"response.error", "error"}:
+                error = event.get("error") or event
+                message = error.get("message") if isinstance(error, dict) else None
+                raise RuntimeError(message or "LLM Responses streaming failed")
+        if final_message:
+            if final_message.get("content") or final_message.get("tool_calls"):
+                return final_message
         return {
             "role": "assistant",
             "content": "".join(part for part in text_parts if part),
@@ -624,7 +677,12 @@ async def run_assistant_message(
         message = await client.chat(messages, TOOLS)
         calls = message.get("tool_calls") or []
         if not calls:
-            text = message.get("content") or "没有可展示的回复。"
+            text = message.get("content")
+            if not text:
+                text = (
+                    "没有可展示的回复。"
+                    f" endpoint={client.api_mode}, tool_calls={len(calls)}"
+                )
             await database.save_llm_history(
                 telegram_id,
                 chat_id,
