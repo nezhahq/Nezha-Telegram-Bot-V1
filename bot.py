@@ -749,7 +749,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["settings_waiting"] = {"type": "llm", "dashboard_id": dashboard_id}
             await edit_message_with_auto_delete(
                 query,
-                "请按三行发送 LLM 配置：\nbase_url\nmodel\napi_key\n\n例如：\nhttps://api.openai.com/v1\ngpt-4o-mini\nsk-...",
+                "请发送 LLM 配置：\nbase_url\nmodel\napi_key\nendpoint(可选：auto/responses/responses_stream/chat)\n\n例如：\nhttps://api.openai.com/v1\ngpt-4o-mini\nsk-...\nauto",
             )
             return
         await edit_message_with_auto_delete(query, "未知设置操作。")
@@ -1542,9 +1542,14 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if len(parts) < 3:
             await update.message.reply_text("LLM 配置需要三行：base_url、model、api_key。")
             return
+        endpoint_mode = parts[3].lower() if len(parts) >= 4 else "auto"
+        if endpoint_mode not in {"auto", "responses", "responses_stream", "chat"}:
+            await update.message.reply_text("endpoint 只能是 auto、responses、responses_stream 或 chat。")
+            return
         await db.upsert_llm_config(
             update.effective_user.id,
             dashboard_id,
+            provider=endpoint_mode,
             base_url=parts[0],
             model=parts[1],
             api_key=parts[2],

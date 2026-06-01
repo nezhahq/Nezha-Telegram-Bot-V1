@@ -3,7 +3,9 @@ import asyncio
 
 from llm_assistant import (
     AssistantRuntime,
+    OpenAICompatibleClient,
     PendingExecution,
+    TOOLS,
     deserialize_pending_execution,
     heuristic_batch_plan,
     redact_secret,
@@ -137,6 +139,157 @@ class LLMAssistantTests(unittest.TestCase):
 
         self.assertIn("目标不唯一", result["error"])
         self.assertIsNone(runtime.pending_execution)
+
+    def test_responses_payload_converts_chat_tools_and_tool_outputs(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses"
+        )
+        messages = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "list servers"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "search_servers", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "search_servers",
+                "content": '{"count":1}',
+            },
+        ]
+
+        payload = client.build_responses_payload(messages, TOOLS)
+
+        self.assertEqual(payload["model"], "gpt-test")
+        self.assertEqual(payload["tools"][0]["type"], "function")
+        self.assertIn("name", payload["tools"][0])
+        self.assertEqual(payload["input"][2]["type"], "function_call")
+        self.assertEqual(payload["input"][3]["type"], "function_call_output")
+
+    def test_streaming_responses_payload_sets_stream_true(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
+        )
+
+        payload = client.build_responses_payload([{"role": "user", "content": "hi"}], TOOLS)
+
+        self.assertTrue(payload["stream"])
+
+    def test_responses_output_normalizes_to_chat_message_shape(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses"
+        )
+
+        message = client.parse_responses_message(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "search_servers",
+                        "arguments": '{"query":"hk"}',
+                    },
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(message["content"], "ok")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "search_servers")
+
+    def test_responses_stream_events_normalize_to_chat_message_shape(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="responses_stream"
+        )
+
+        message = client.parse_responses_stream_events(
+            [
+                {"type": "response.output_text.delta", "delta": "ok"},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "search_servers",
+                        "arguments": '{"query":"hk"}',
+                    },
+                },
+            ]
+        )
+
+        self.assertEqual(message["content"], "ok")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "search_servers")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"query":"hk"}')
+
+    def test_responses_retries_with_stream_when_required(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1", "sk-test", "gpt-test", api_mode="auto"
+        )
+        posts = []
+
+        class Response:
+            def __init__(self, status, payload=None, lines=None):
+                self.status = status
+                self.payload = payload
+                self.content = lines or []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                return self.payload
+
+        class Session:
+            def post(self, url, json, headers):
+                posts.append(json)
+                if len(posts) == 1:
+                    return Response(
+                        400,
+                        {"error": {"message": "stream=true required for this endpoint"}},
+                    )
+                return Response(
+                    200,
+                    lines=[
+                        b'data: {"type":"response.output_text.delta","delta":"ok"}\n',
+                        b"data: [DONE]\n",
+                    ],
+                )
+
+        message = asyncio.run(
+            client.post_responses(
+                Session(),
+                {"Authorization": "Bearer sk-test"},
+                [{"role": "user", "content": "hi"}],
+                TOOLS,
+            )
+        )
+
+        self.assertNotIn("stream", posts[0])
+        self.assertTrue(posts[1]["stream"])
+        self.assertEqual(message["content"], "ok")
+
+    def test_responses_endpoint_base_url_is_normalized(self):
+        client = OpenAICompatibleClient(
+            "https://api.openai.com/v1/responses", "sk-test", "gpt-test"
+        )
+
+        self.assertEqual(client.base_url, "https://api.openai.com/v1")
+        self.assertEqual(client.api_mode, "responses")
 
 
 if __name__ == "__main__":
