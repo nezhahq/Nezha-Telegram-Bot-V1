@@ -101,18 +101,44 @@ async def load_pending_execution_for_confirmation(
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url, api_key, model, timeout=60):
-        import aiohttp
-
+    def __init__(self, base_url, api_key, model, timeout=60, api_mode="auto"):
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        api_mode = (api_mode or "auto").lower()
+        if self.base_url.endswith("/responses"):
+            self.base_url = self.base_url[: -len("/responses")]
+            if api_mode == "auto":
+                api_mode = "responses"
+        elif self.base_url.endswith("/chat/completions"):
+            self.base_url = self.base_url[: -len("/chat/completions")]
+            if api_mode == "auto":
+                api_mode = "chat"
         self.api_key = api_key
         self.model = model
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.timeout_seconds = timeout
+        self.api_mode = api_mode if api_mode in {"auto", "chat", "responses", "responses_stream"} else "auto"
 
     async def chat(self, messages, tools):
         import aiohttp
 
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if self.api_mode in {"responses", "responses_stream"}:
+                return await self.post_responses(
+                    session,
+                    headers,
+                    messages,
+                    tools,
+                    stream=self.api_mode == "responses_stream",
+                )
+            try:
+                return await self.post_chat_completions(session, headers, messages, tools)
+            except RuntimeError as exc:
+                if self.api_mode == "chat" or not self.should_retry_with_responses(exc):
+                    raise
+                return await self.post_responses(session, headers, messages, tools)
+
+    async def post_chat_completions(self, session, headers, messages, tools):
         payload = {
             "model": self.model,
             "messages": messages,
@@ -120,15 +146,202 @@ class OpenAICompatibleClient:
             "tool_choice": "auto",
             "temperature": 0.2,
         }
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            async with session.post(
-                f"{self.base_url}/chat/completions", json=payload, headers=headers
-            ) as resp:
-                data = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    message = data.get("error", {}).get("message") if isinstance(data, dict) else None
-                    raise RuntimeError(message or f"LLM 请求失败: HTTP {resp.status}")
-                return data["choices"][0]["message"]
+        async with session.post(
+            f"{self.base_url}/chat/completions", json=payload, headers=headers
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+                raise RuntimeError(message or f"LLM 请求失败: HTTP {resp.status}")
+            return data["choices"][0]["message"]
+
+    async def post_responses(self, session, headers, messages, tools, stream=None):
+        stream = self.api_mode == "responses_stream" if stream is None else stream
+        payload = self.build_responses_payload(messages, tools, stream=stream)
+        async with session.post(
+            f"{self.base_url}/responses", json=payload, headers=headers
+        ) as resp:
+            if stream and resp.status < 400:
+                return await self.parse_responses_stream(resp)
+            data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                message = data.get("error", {}).get("message") if isinstance(data, dict) else None
+                if not stream and self.should_retry_with_streaming_responses(message):
+                    return await self.post_responses(
+                        session, headers, messages, tools, stream=True
+                    )
+                raise RuntimeError(message or f"LLM Responses 请求失败: HTTP {resp.status}")
+            return self.parse_responses_message(data)
+
+    def should_retry_with_responses(self, exc):
+        text = str(exc).lower()
+        return (
+            "chat/completions" in text
+            or "chat completions" in text
+            or "endpoint not supported" in text
+            or "/v1/chat/completions" in text
+        )
+
+    def should_retry_with_streaming_responses(self, message):
+        text = str(message or "").lower()
+        compact = re.sub(r"\s+", " ", text)
+        return (
+            "stream required" in compact
+            or "stream=true required" in compact
+            or "streaming required" in compact
+            or ("stream" in compact and "required" in compact)
+        )
+
+    def build_responses_payload(self, messages, tools, stream=None):
+        stream = self.api_mode == "responses_stream" if stream is None else stream
+        payload = {
+            "model": self.model,
+            "input": self.convert_messages_to_responses_input(messages),
+            "tools": self.convert_tools_to_responses(tools),
+            "tool_choice": "auto",
+            "temperature": 0.2,
+        }
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def convert_tools_to_responses(self, tools):
+        response_tools = []
+        for tool in tools:
+            function = tool.get("function") or {}
+            response_tools.append(
+                {
+                    "type": "function",
+                    "name": function.get("name"),
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
+        return response_tools
+
+    def convert_messages_to_responses_input(self, messages):
+        items = []
+        for message in messages:
+            role = message.get("role")
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": message.get("tool_call_id"),
+                        "output": message.get("content") or "",
+                    }
+                )
+                continue
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                for call in tool_calls:
+                    function = call.get("function") or {}
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call.get("id"),
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments") or "{}",
+                        }
+                    )
+                continue
+            content = message.get("content")
+            if content:
+                items.append({"role": role, "content": content})
+        return items
+
+    def parse_responses_message(self, data):
+        output = data.get("output") or []
+        tool_calls = []
+        text_parts = []
+        for item in output:
+            if item.get("type") == "function_call":
+                tool_calls.append(
+                    {
+                        "id": item.get("call_id") or item.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments") or "{}",
+                        },
+                    }
+                )
+            elif item.get("type") == "message":
+                for content in item.get("content") or []:
+                    if content.get("type") in {"output_text", "text"}:
+                        text_parts.append(content.get("text") or "")
+        return {
+            "role": "assistant",
+            "content": "\n".join(part for part in text_parts if part),
+            "tool_calls": tool_calls,
+        }
+
+    async def parse_responses_stream(self, resp):
+        events = []
+        buffer = []
+        if hasattr(resp.content, "__aiter__"):
+            async for raw_line in resp.content:
+                self._consume_responses_stream_line(events, buffer, raw_line)
+        else:
+            for raw_line in resp.content:
+                self._consume_responses_stream_line(events, buffer, raw_line)
+        if buffer:
+            self._append_responses_stream_event(events, "\n".join(buffer))
+        return self.parse_responses_stream_events(events)
+
+    def _consume_responses_stream_line(self, events, buffer, raw_line):
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        for part in line.splitlines():
+            part = part.strip()
+            if not part:
+                if buffer:
+                    self._append_responses_stream_event(events, "\n".join(buffer))
+                    buffer.clear()
+                continue
+            if part.startswith("data:"):
+                buffer.append(part[5:].strip())
+        if buffer and line.endswith("\n"):
+            self._append_responses_stream_event(events, "\n".join(buffer))
+            buffer.clear()
+
+    def _append_responses_stream_event(self, events, payload):
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            events.append(json.loads(payload))
+        except json.JSONDecodeError:
+            return
+
+    def parse_responses_stream_events(self, events):
+        tool_calls = []
+        text_parts = []
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "response.output_text.delta":
+                text_parts.append(event.get("delta") or "")
+                continue
+            if event_type == "response.output_item.done":
+                item = event.get("item") or {}
+                if item.get("type") == "function_call":
+                    tool_calls.append(
+                        {
+                            "id": item.get("call_id") or item.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name"),
+                                "arguments": item.get("arguments") or "{}",
+                            },
+                        }
+                    )
+                elif item.get("type") == "message":
+                    for content in item.get("content") or []:
+                        if content.get("type") in {"output_text", "text"}:
+                            text_parts.append(content.get("text") or "")
+        return {
+            "role": "assistant",
+            "content": "".join(part for part in text_parts if part),
+            "tool_calls": tool_calls,
+        }
 
 
 class AssistantRuntime:
@@ -398,6 +611,7 @@ async def run_assistant_message(
         llm_config.get("base_url"),
         llm_config.get("api_key"),
         llm_config.get("model") or "gpt-4o-mini",
+        api_mode=llm_config.get("provider") or "auto",
     )
     history = bounded_history(
         await database.get_llm_history(
