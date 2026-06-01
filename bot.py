@@ -720,7 +720,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"认证：{auth_text}\n"
                 f"API Token：{token_text}\n"
                 f"LLM/MCP 助手：{llm_text}\n\n"
-                "提示：API Token 建议授予 nezha:inventory:read、nezha:server:read、nezha:server:exec，并限制服务器白名单。"
+                "提示：完整使用建议授予 nezha:inventory:read、nezha:service:read、nezha:cron:read、nezha:cron:exec、nezha:server:exec；需要 MCP 读取单机详情时再加 nezha:server:read，并限制服务器白名单。"
             )
             keyboard = [
                 [InlineKeyboardButton("测试连接", callback_data=f"settings_test_{dashboard_id}")],
@@ -786,8 +786,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for server_id, server_name in zip(pending.server_ids, pending.server_names):
                 try:
                     result = await api.execute_command_mcp(server_id, pending.command)
-                    content = result.get("content") or []
-                    output = content[0].get("text", "") if content else ""
+                    output = api.format_mcp_exec_output(result)
                     first_line = output.strip().splitlines()[0] if output.strip() else "已完成"
                     lines.append(f"✅ {server_name}: {first_line[:80]}")
                 except Exception as e:
@@ -1500,7 +1499,7 @@ async def send_dashboard_settings(update, context, dashboard_id):
         f"认证：{auth_text}\n"
         f"API Token：{token_text}\n"
         f"LLM/MCP 助手：{llm_text}\n\n"
-        "提示：API Token 建议授予 nezha:inventory:read、nezha:server:read、nezha:server:exec，并限制服务器白名单。"
+        "提示：完整使用建议授予 nezha:inventory:read、nezha:service:read、nezha:cron:read、nezha:cron:exec、nezha:server:exec；需要 MCP 读取单机详情时再加 nezha:server:read，并限制服务器白名单。"
     )
     keyboard = [
         [InlineKeyboardButton("测试连接", callback_data=f"settings_test_{dashboard_id}")],
@@ -1527,7 +1526,7 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         dashboard_row = await db.get_dashboard(update.effective_user.id, dashboard_id)
         api = NezhaAPI(dashboard_row["dashboard_url"], auth_type="token", api_token=value)
         try:
-            await api.validate_auth()
+            await api.validate_api_token()
         except Exception as e:
             await update.message.reply_text(f"Token 验证失败：{e}")
             await api.close()

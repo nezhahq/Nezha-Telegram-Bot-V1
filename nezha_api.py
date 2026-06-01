@@ -1,6 +1,10 @@
 import aiohttp
 import asyncio
 import logging
+import json
+
+
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 class NezhaAPI:
     def __init__(self, dashboard_url, username=None, password=None, auth_type="password", api_token=None, timeout=30):
@@ -14,6 +18,7 @@ class NezhaAPI:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.session = None
         self.lock = asyncio.Lock()
+        self.csrf_token = None
 
     async def get_session(self):
         if self.session is None or self.session.closed:
@@ -40,21 +45,38 @@ class NezhaAPI:
             }
             session = await self.get_session()
             async with session.post(login_url, json=payload) as resp:
+                self.update_csrf_token(resp)
                 data = await resp.json(content_type=None)
                 if data.get('success'):
                     self.token = data['data']['token']
                 else:
                     raise Exception('认证失败，请检查用户名和密码。')
 
+    def update_csrf_token(self, resp):
+        cookie = resp.cookies.get("nz-csrf")
+        if cookie and cookie.value:
+            self.csrf_token = cookie.value
+
+    def build_request_headers(self, method, headers=None):
+        headers = dict(headers or {})
+        headers['Authorization'] = f'Bearer {self.token}'
+        if (
+            self.auth_type == "password"
+            and method.upper() not in SAFE_METHODS
+            and self.csrf_token
+        ):
+            headers['X-CSRF-Token'] = self.csrf_token
+        return headers
+
     async def request(self, method, endpoint, **kwargs):
         await self.authenticate()
         url = f'{self.base_url}{endpoint}'
-        headers = kwargs.get('headers', {})
-        headers['Authorization'] = f'Bearer {self.token}'
-        kwargs['headers'] = headers
+        headers = kwargs.pop('headers', {})
+        kwargs['headers'] = self.build_request_headers(method, headers)
 
         session = await self.get_session()
         async with session.request(method, url, **kwargs) as resp:
+            self.update_csrf_token(resp)
             if resp.status == 401 and self.auth_type == "password":
                 self.token = None
                 return await self.request(method, endpoint, **kwargs)
@@ -71,6 +93,10 @@ class NezhaAPI:
     async def validate_auth(self):
         data = await self.get_servers()
         return bool(data and data.get('success'))
+
+    async def validate_api_token(self):
+        result = await self.mcp_call("meta.whoami", {})
+        return bool(result)
 
     async def get_overview(self):
         data = await self.request('GET', '/server')
@@ -95,8 +121,6 @@ class NezhaAPI:
     async def run_cron_job(self, cron_id):
         endpoint = f'/cron/{cron_id}/manual'
         data = await self.request('POST', endpoint)
-        if data is None:
-            data = await self.request('GET', endpoint)
         return data
 
     async def mcp_call(self, tool_name, arguments=None, request_id=1):
@@ -163,9 +187,40 @@ class NezhaAPI:
         data = await self.request('GET', '/service')
         return data
 
-    async def get_service_histories(self, server_id):
-        endpoint = f'/service/{server_id}'
-        data = await self.request('GET', endpoint)
+    def format_mcp_exec_output(self, result):
+        structured = result.get("structuredContent") or result.get("structured_content")
+        if isinstance(structured, dict):
+            exit_code = structured.get("exit_code")
+            stdout = (structured.get("stdout") or "").strip()
+            stderr = (structured.get("stderr") or "").strip()
+            parts = []
+            if exit_code is not None:
+                parts.append(f"exit_code={exit_code}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout}")
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            if parts:
+                return "\n".join(parts)
+
+        content = result.get("content") or []
+        if not content:
+            return ""
+        text = content[0].get("text", "")
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return text
+        if isinstance(parsed, dict):
+            return self.format_mcp_exec_output({"structuredContent": parsed})
+        return text
+
+    async def get_service_histories(self, server_id, period=None):
+        endpoint = f'/service/{server_id}/history'
+        kwargs = {}
+        if period is not None:
+            kwargs["params"] = {"period": period}
+        data = await self.request('GET', endpoint, **kwargs)
         return data
 
     async def get_alert_rules(self):
